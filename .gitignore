@@ -1,0 +1,17 @@
+# Large data
+data/raw/
+data/processed/
+
+# Model artifacts
+results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Environment
+.venv/
+.env
+*.egg-info/
