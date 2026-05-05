@@ -1,4 +1,4 @@
-# 📂 DataFlix Data Setup
+# DataFlix Data Setup
 
 Welcome to the DataFlix data preparation guide. The system relies on multiple datasets for collaborative filtering and semantic embeddings. 
 
