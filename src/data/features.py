@@ -1,350 +1,495 @@
 """
-DataFlix — Feature Engineering
-Builds all .pt feature tensors needed for model training:
-  - sbert_embeddings.pt
-  - genre_table.pt
-  - popularity.pt
-  - user_features.pt
-  - history_embeddings.pt
+DataFlix — Step 3: Feature Engineering
+src/data/features.py
 
-Also builds netflix_to_ml_movie_map.json alignment from Netflix Movie_ID → ML movieId.
+Three parallel feature streams, all keyed on movie_idx:
+
+  Stream A — IMDB structured features
+    genre OHE (20-dim) + runtime (1) + avg_vote (1) + log_num_votes (1) = 23-dim
+    Source: title.basics.tsv + title.ratings.tsv joined via ML links.csv imdbId
+
+  Stream B — SBERT semantic embeddings
+    384-dim dense vector per movie from TMDB synopsis
+    Model: sentence-transformers/all-MiniLM-L6-v2
+    Fallback: zero vector for movies with no synopsis
+
+  Stream C — Popularity & user history features
+    Per-movie global popularity (log interaction count)
+    Per-user history embedding (mean of SBERT vectors of rated movies)
+
+All tensors saved to data/processed/ as .pt files.
 """
 
-import sys
-import json
+import logging
+import re
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
 
-ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(ROOT))
-
-from src.config import (
-    PROCESSED_DIR, ROOT_DIR, SBERT_DIM, NUM_GENRES
-)
-
-
-# ─── Alignment ────────────────────────────────────────────────
-def build_netflix_ml_alignment(movie_map: dict) -> dict:
-    """
-    Match Netflix movies → MovieLens movieId using title+year similarity.
-    Saves netflix_to_ml_movie_map.json in PROCESSED_DIR.
-
-    Returns dict: {netflix_movie_id: ml_movie_idx}
-    """
-    alignment_path = PROCESSED_DIR / "netflix_to_ml_movie_map.json"
-
-    if alignment_path.exists():
-        print("  [alignment] Loading existing netflix_to_ml_movie_map.json")
-        with open(alignment_path) as f:
-            raw = json.load(f)
-        return {int(k): int(v) for k, v in raw.items()}
-
-    print("  [alignment] Building Netflix→ML movie alignment ...")
-
-    nf_movies_path = ROOT_DIR / "archive" / "Netflix_Dataset_Movie.csv"
-    ml_movies_path = ROOT_DIR / "ml-25m" / "ml-25m" / "movies.csv"
-
-    nf_movies = pd.read_csv(nf_movies_path)
-    nf_movies = nf_movies.rename(columns={"Movie_ID": "movie_id", "Year": "year", "Name": "title"})
-    nf_movies["title_clean"] = nf_movies["title"].str.lower().str.strip()
-    nf_movies["year"] = pd.to_numeric(nf_movies["year"], errors="coerce").fillna(0).astype(int)
-
-    ml_movies = pd.read_csv(ml_movies_path)
-    # ML title format: "Title (year)"
-    ml_movies["year"] = ml_movies["title"].str.extract(r"\((\d{4})\)$")[0]
-    ml_movies["year"] = pd.to_numeric(ml_movies["year"], errors="coerce").fillna(0).astype(int)
-    ml_movies["title_clean"] = (
-        ml_movies["title"]
-        .str.replace(r"\s*\(\d{4}\)\s*$", "", regex=True)
-        .str.lower()
-        .str.strip()
+try:
+    from src.config import (
+        PROCESSED_DIR,
+        ML_LINKS_PATH, ML_MOVIES_PATH,
+        IMDB_BASICS_PATH, IMDB_RATINGS_PATH,
+        TMDB_CSV_PATH,
+        MOVIE_MAP_CSV, USER_MAP_CSV,
+        TRAIN_CSV,
+        IMDB_FEATURES_PATH, SBERT_EMBEDDINGS_PATH,
+        GENRE_TABLE_PATH, POPULARITY_PATH, HISTORY_EMBEDDINGS_PATH,
+        SBERT_DIM, NUM_GENRES, IMDB_FEAT_DIM,
+        DEVICE,
     )
-    # Build a lookup: (title_clean, year) → movieId
-    ml_lookup = {}
-    for _, row in ml_movies.iterrows():
-        key = (row["title_clean"], row["year"])
-        ml_lookup[key] = row["movieId"]
-    # Also lookup by title alone (year=0 fallback)
-    ml_title_lookup = {}
-    for _, row in ml_movies.iterrows():
-        ml_title_lookup[row["title_clean"]] = row["movieId"]
+except ModuleNotFoundError:
+    _ROOT = Path(__file__).resolve().parent.parent.parent
+    PROCESSED_DIR           = _ROOT / "data/processed"
+    ML_LINKS_PATH           = _ROOT / "data/raw/ml-25m/ml-25m/links.csv"
+    ML_MOVIES_PATH          = _ROOT / "data/raw/ml-25m/ml-25m/movies.csv"
+    IMDB_BASICS_PATH        = _ROOT / "data/raw/imdb/title.basics.tsv"
+    IMDB_RATINGS_PATH       = _ROOT / "data/raw/imdb/title.ratings.tsv"
+    TMDB_CSV_PATH           = _ROOT / "data/raw/tmdb/TMDB_movie_dataset_v11.csv"
+    MOVIE_MAP_CSV           = PROCESSED_DIR / "movie_map.csv"
+    USER_MAP_CSV            = PROCESSED_DIR / "user_map.csv"
+    TRAIN_CSV               = PROCESSED_DIR / "train.csv"
+    IMDB_FEATURES_PATH      = PROCESSED_DIR / "imdb_features.pt"
+    SBERT_EMBEDDINGS_PATH   = PROCESSED_DIR / "sbert_embeddings.pt"
+    GENRE_TABLE_PATH        = PROCESSED_DIR / "genre_table.pt"
+    POPULARITY_PATH         = PROCESSED_DIR / "popularity.pt"
+    HISTORY_EMBEDDINGS_PATH = PROCESSED_DIR / "history_embeddings.pt"
+    SBERT_DIM               = 384
+    NUM_GENRES              = 20
+    IMDB_FEAT_DIM           = 23
+    DEVICE                  = torch.device("cpu")
 
-    nf_to_ml = {}
-    for _, row in nf_movies.iterrows():
-        key = (row["title_clean"], row["year"])
-        if key in ml_lookup:
-            nf_to_ml[int(row["movie_id"])] = int(ml_lookup[key])
-        elif row["title_clean"] in ml_title_lookup:
-            nf_to_ml[int(row["movie_id"])] = int(ml_title_lookup[row["title_clean"]])
-
-    print(f"  [alignment] Matched {len(nf_to_ml):,} / {len(nf_movies):,} Netflix movies")
-
-    # Save as JSON (netflix_movie_id → ml_movieId)
-    with open(alignment_path, "w") as f:
-        json.dump({str(k): v for k, v in nf_to_ml.items()}, f)
-
-    # Convert ml_movieId → movie_idx using movie_map
-    aligned = {}
-    for nf_id, ml_id in nf_to_ml.items():
-        if ml_id in movie_map:
-            aligned[nf_id] = movie_map[ml_id]
-
-    return aligned
+logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
+log = logging.getLogger(__name__)
 
 
-# ─── Synopses from TMDB ───────────────────────────────────────
-def load_synopses_from_tmdb(movie_map: dict) -> dict:
+# ─────────────────────────────────────────────────────────────────────────────
+# Stream A — IMDB structured features
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Top-20 genres by frequency in IMDB — fixed vocabulary for OHE consistency
+GENRE_VOCAB = [
+    "Drama", "Comedy", "Thriller", "Action", "Romance",
+    "Horror", "Crime", "Documentary", "Adventure", "Sci-Fi",
+    "Mystery", "Fantasy", "Biography", "Animation", "Family",
+    "History", "Music", "War", "Western", "Sport",
+]
+assert len(GENRE_VOCAB) == NUM_GENRES, \
+    f"GENRE_VOCAB has {len(GENRE_VOCAB)} entries but NUM_GENRES={NUM_GENRES}"
+
+GENRE_TO_IDX = {g: i for i, g in enumerate(GENRE_VOCAB)}
+
+
+def _load_imdb_enrichment() -> pd.DataFrame:
     """
-    Load movie synopses from the local TMDB CSV, matched to movie_map.
+    Join title.basics + title.ratings and return per-tconst features.
 
-    Returns dict: {movie_idx: synopsis_string}
+    Returns DataFrame with columns:
+      tconst, genres_list, runtime_norm, avg_vote_norm, log_num_votes_norm
+    All numeric features are normalised to [0, 1] range.
     """
-    tmdb_path = ROOT_DIR / "tmdb" / "TMDB_movie_dataset_v11.csv"
-    ml_movies_path = ROOT_DIR / "ml-25m" / "ml-25m" / "movies.csv"
-    links_path = ROOT_DIR / "ml-25m" / "ml-25m" / "links.csv"
+    log.info("  Loading IMDB basics...")
+    basics = pd.read_csv(
+        IMDB_BASICS_PATH, sep="\t", na_values="\\N", low_memory=False,
+        usecols=["tconst", "titleType", "runtimeMinutes", "genres"],
+    )
+    basics = basics[basics["titleType"] == "movie"].copy()
+    basics["runtime"] = pd.to_numeric(basics["runtimeMinutes"], errors="coerce")
+    basics = basics.drop(columns=["titleType", "runtimeMinutes"])
 
-    if not tmdb_path.exists():
-        print("  [synopses] TMDB CSV not found, using empty synopses.")
-        return {}
+    log.info("  Loading IMDB ratings...")
+    ratings = pd.read_csv(
+        IMDB_RATINGS_PATH, sep="\t", na_values="\\N",
+        usecols=["tconst", "averageRating", "numVotes"],
+    )
 
-    print("  [synopses] Loading TMDB synopses ...")
-    tmdb = pd.read_csv(tmdb_path, usecols=["id", "title", "overview"])
-    tmdb = tmdb.dropna(subset=["overview"])
-    tmdb["overview"] = tmdb["overview"].astype(str)
+    df = basics.merge(ratings, on="tconst", how="left")
+
+    # Normalise runtime: clip to [60, 240] minutes then scale to [0, 1]
+    df["runtime_norm"] = (
+        df["runtime"].clip(60, 240).fillna(100) - 60
+    ) / 180.0
+
+    # Normalise avg_vote: [1, 10] → [0, 1]
+    df["avg_vote_norm"] = (
+        df["averageRating"].fillna(df["averageRating"].median()) - 1
+    ) / 9.0
+
+    # Log-normalise num_votes: log1p then scale to [0, 1]
+    log_votes = np.log1p(df["numVotes"].fillna(0))
+    df["log_num_votes_norm"] = log_votes / log_votes.max()
+
+    # Parse genres string "Drama,Crime,Thriller" into list
+    df["genres_list"] = df["genres"].fillna("").apply(
+        lambda s: [g for g in s.split(",") if g in GENRE_TO_IDX]
+    )
+
+    log.info(f"  IMDB enrichment: {len(df):,} movies")
+    return df[["tconst", "genres_list", "runtime_norm", "avg_vote_norm", "log_num_votes_norm"]]
+
+
+def build_imdb_features(movie_map: dict) -> torch.Tensor:
+    """
+    Build the IMDB feature matrix: shape (n_movies, IMDB_FEAT_DIM=23).
+
+    Layout per row:
+      [0:20]  genre OHE  (multi-hot, a movie can belong to multiple genres)
+      [20]    runtime_norm
+      [21]    avg_vote_norm
+      [22]    log_num_votes_norm
+
+    Movies not in IMDB get a zero vector (handled gracefully by the model
+    via a learned fallback embedding).
+
+    Parameters
+    ----------
+    movie_map : {movie_id (int) → movie_idx (int)}
+    """
+    n_movies = len(movie_map)
+    features = np.zeros((n_movies, IMDB_FEAT_DIM), dtype=np.float32)
+
+    # Load ML links to map movieId → tconst
+    links = pd.read_csv(ML_LINKS_PATH, usecols=["movieId", "imdbId"])
+    links["tconst"] = links["imdbId"].apply(
+        lambda x: f"tt{int(x):07d}" if pd.notna(x) else None
+    )
+    ml_id_to_tconst = dict(zip(links["movieId"], links["tconst"]))
+
+    imdb_df = _load_imdb_enrichment()
+    tconst_to_row = dict(zip(imdb_df["tconst"], imdb_df.itertuples(index=False)))
+
+    n_matched = 0
+    for movie_id, movie_idx in movie_map.items():
+        tconst = ml_id_to_tconst.get(int(movie_id))
+        if tconst is None or tconst not in tconst_to_row:
+            continue  # Zero vector fallback
+
+        row = tconst_to_row[tconst]
+        n_matched += 1
+
+        # Genre multi-hot
+        for genre in row.genres_list:
+            if genre in GENRE_TO_IDX:
+                features[movie_idx, GENRE_TO_IDX[genre]] = 1.0
+
+        features[movie_idx, 20] = row.runtime_norm
+        features[movie_idx, 21] = row.avg_vote_norm
+        features[movie_idx, 22] = row.log_num_votes_norm
+
+    log.info(f"  IMDB features: {n_matched:,}/{n_movies:,} movies matched "
+             f"({n_matched/n_movies*100:.1f}%)")
+
+    tensor = torch.tensor(features, dtype=torch.float32)
+    torch.save(tensor, IMDB_FEATURES_PATH)
+    log.info(f"  Saved IMDB features → {IMDB_FEATURES_PATH}  shape={tuple(tensor.shape)}")
+    return tensor
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stream B — SBERT embeddings from TMDB synopses
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_tmdb_synopses(movie_map: dict) -> dict[int, str]:
+    """
+    Load TMDB CSV and return {movie_idx → synopsis string}.
+    Matches via tmdbId from ML links.csv.
+    Movies with no synopsis get an empty string (handled by fallback below).
+    """
+    log.info("  Loading TMDB synopses...")
+    links = pd.read_csv(ML_LINKS_PATH, usecols=["movieId", "tmdbId"])
+    links["tmdbId"] = pd.to_numeric(links["tmdbId"], errors="coerce")
+    ml_id_to_tmdb = {
+        int(row.movieId): int(row.tmdbId)
+        for row in links.itertuples(index=False)
+        if pd.notna(row.tmdbId)
+    }
+
+    tmdb = pd.read_csv(TMDB_CSV_PATH, low_memory=False, usecols=["id", "overview"])
     tmdb["id"] = pd.to_numeric(tmdb["id"], errors="coerce")
+    tmdb = tmdb.dropna(subset=["id"])
+    tmdb_id_to_overview = dict(zip(tmdb["id"].astype(int), tmdb["overview"].fillna("")))
 
-    # Try to match via links.csv (movieId → tmdbId)
-    synopses = {}
-    if links_path.exists():
-        links = pd.read_csv(links_path)
-        links["tmdbId"] = pd.to_numeric(links["tmdbId"], errors="coerce")
-        tmdb_id_map = dict(zip(tmdb["id"], tmdb["overview"]))
-        for _, row in links.iterrows():
-            ml_id = int(row["movieId"])
-            if ml_id in movie_map and not pd.isna(row["tmdbId"]):
-                tmdb_id = int(row["tmdbId"])
-                if tmdb_id in tmdb_id_map:
-                    synopses[movie_map[ml_id]] = tmdb_id_map[tmdb_id]
+    synopses: dict[int, str] = {}
+    for movie_id, movie_idx in movie_map.items():
+        tmdb_id = ml_id_to_tmdb.get(int(movie_id))
+        if tmdb_id is None:
+            synopses[movie_idx] = ""
+            continue
+        overview = tmdb_id_to_overview.get(tmdb_id, "")
+        synopses[movie_idx] = overview if isinstance(overview, str) else ""
 
-    if not synopses:
-        # Fallback: match by title
-        ml_movies = pd.read_csv(ml_movies_path)
-        ml_movies["title_clean"] = (
-            ml_movies["title"]
-            .str.replace(r"\s*\(\d{4}\)\s*$", "", regex=True)
-            .str.lower().str.strip()
-        )
-        tmdb["title_clean"] = tmdb["title"].str.lower().str.strip()
-        tmdb_title_map = dict(zip(tmdb["title_clean"], tmdb["overview"]))
-        for _, row in ml_movies.iterrows():
-            ml_id = int(row["movieId"])
-            if ml_id in movie_map:
-                synopsis = tmdb_title_map.get(row["title_clean"], "")
-                if synopsis:
-                    synopses[movie_map[ml_id]] = synopsis
-
-    print(f"  [synopses] Found synopses for {len(synopses):,} / {len(movie_map):,} movies")
+    n_with_synopsis = sum(1 for s in synopses.values() if s.strip())
+    log.info(f"  TMDB synopses: {n_with_synopsis:,}/{len(movie_map):,} movies "
+             f"have non-empty synopsis ({n_with_synopsis/len(movie_map)*100:.1f}%)")
     return synopses
 
 
-# ─── Main Feature Engineering ─────────────────────────────────
-def run_feature_engineering(
-    train_df: pd.DataFrame,
-    ml_movies: pd.DataFrame,
-    n_users: int,
-    n_movies: int,
-    synopses: dict,
-):
+def build_sbert_embeddings(movie_map: dict) -> torch.Tensor:
     """
-    Build and save all feature tensors to PROCESSED_DIR.
+    Encode TMDB synopses with SBERT → (n_movies, 384) float32 tensor.
+
+    Movies with no synopsis get a zero vector. The hybrid model treats
+    zero vectors as "content unknown" and relies more heavily on CF signal
+    for those items.
+
+    Uses batch encoding for efficiency — encoding one at a time on 25k movies
+    would take hours; batching reduces this to minutes.
     """
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-
-    # ── 1. SBERT Embeddings ──
-    _build_sbert_embeddings(n_movies, synopses)
-
-    # ── 2. Genre Table ──
-    _build_genre_table(ml_movies, n_movies)
-
-    # ── 3. Popularity ──
-    _build_popularity(train_df, n_movies)
-
-    # ── 4. User Features ──
-    _build_user_features(train_df, n_users)
-
-    # ── 5. History Embeddings ──
-    sbert_data = torch.load(PROCESSED_DIR / "sbert_embeddings.pt", weights_only=False)
-    sbert_emb = sbert_data["embeddings"]  # (n_movies, SBERT_DIM)
-    _build_history_embeddings(train_df, n_users, n_movies, sbert_emb)
-
-    print("  [features] All feature tensors saved.")
-
-
-def _build_sbert_embeddings(n_movies: int, synopses: dict):
-    out_path = PROCESSED_DIR / "sbert_embeddings.pt"
-    if out_path.exists():
-        print("  [sbert] Already exists, skipping.")
-        return
-
-    print("  [sbert] Encoding synopses with sentence-transformers ...")
     try:
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("all-MiniLM-L6-v2")
+    except ImportError:
+        raise ImportError(
+            "sentence-transformers not installed. "
+            "Run: pip install sentence-transformers"
+        )
 
-        texts = []
-        idx_list = []
-        for idx in range(n_movies):
-            text = synopses.get(idx, "")
-            texts.append(text if text else "unknown movie")
-            idx_list.append(idx)
+    n_movies  = len(movie_map)
+    synopses  = _load_tmdb_synopses(movie_map)
 
-        # Encode in batches
-        batch_size = 256
-        all_embeds = []
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i: i + batch_size]
-            emb = model.encode(batch, convert_to_tensor=True, show_progress_bar=False)
-            all_embeds.append(emb.cpu())
+    # Build ordered lists to preserve index alignment
+    movie_indices = sorted(synopses.keys())
+    texts = [synopses[idx] for idx in movie_indices]
 
-        embeddings = torch.cat(all_embeds, dim=0)  # (n_movies, 384)
-    except Exception as e:
-        print(f"  [sbert] Warning: {e}. Falling back to random embeddings.")
-        embeddings = torch.randn(n_movies, SBERT_DIM)
+    # Identify which movies actually have content
+    has_content  = [bool(t.strip()) for t in texts]
+    content_idxs = [i for i, h in enumerate(has_content) if h]
+    content_texts = [texts[i] for i in content_idxs]
 
-    torch.save({"embeddings": embeddings}, out_path)
-    print(f"  [sbert] Saved: {embeddings.shape}")
+    log.info(f"  Loading SBERT model (all-MiniLM-L6-v2)...")
+    model = SentenceTransformer("all-MiniLM-L6-v2")
 
+    log.info(f"  Encoding {len(content_texts):,} synopses in batches...")
+    embeddings_content = model.encode(
+        content_texts,
+        batch_size=256,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=True,   # L2 normalise → cosine similarity = dot product
+    )
 
-def _build_genre_table(ml_movies: pd.DataFrame, n_movies: int):
-    out_path = PROCESSED_DIR / "genre_table.pt"
-    if out_path.exists():
-        print("  [genres] Already exists, skipping.")
-        return
+    # Assemble full embedding matrix with zeros for missing synopses
+    embeddings = np.zeros((n_movies, SBERT_DIM), dtype=np.float32)
+    for sparse_i, movie_i in enumerate(content_idxs):
+        movie_idx = movie_indices[movie_i]
+        embeddings[movie_idx] = embeddings_content[sparse_i]
 
-    print("  [genres] Building genre table ...")
-    if "genres" not in ml_movies.columns:
-        genre_tensor = torch.zeros(n_movies, NUM_GENRES)
-        torch.save({
-            "genre_table": genre_tensor,
-            "n_genres": NUM_GENRES,
-            "genre_names": [],
-            "movie_genre_ids": {},
-        }, out_path)
-        return
+    n_zero = n_movies - len(content_idxs)
+    log.info(f"  {n_zero:,} movies have zero-vector fallback (no synopsis)")
 
-    # Collect all genres
-    all_genres = set()
-    for genres_str in ml_movies["genres"].dropna():
-        for g in genres_str.split("|"):
-            all_genres.add(g.strip())
-    all_genres.discard("(no genres listed)")
-    all_genres = sorted(all_genres)
-    n_genres = min(len(all_genres), NUM_GENRES)
-    genre_to_idx = {g: i for i, g in enumerate(all_genres) if i < n_genres}
-
-    # Build genre matrix and per-movie genre ID list
-    genre_table = torch.zeros(n_movies, n_genres)
-    movie_genre_ids: dict = {}   # movie_idx -> [genre_id, ...]
-
-    for _, row in ml_movies.iterrows():
-        idx = row.get("movie_idx", -1)
-        if pd.isna(idx) or int(idx) >= n_movies:
-            continue
-        idx = int(idx)
-        if pd.isna(row.get("genres", "")):
-            continue
-        gids = []
-        for g in str(row["genres"]).split("|"):
-            g = g.strip()
-            if g in genre_to_idx:
-                gid = genre_to_idx[g]
-                genre_table[idx, gid] = 1.0
-                gids.append(gid)
-        if gids:
-            movie_genre_ids[idx] = gids
-
-    torch.save({
-        "genre_table": genre_table,
-        "n_genres": n_genres,
-        "genre_names": all_genres[:n_genres],
-        "movie_genre_ids": movie_genre_ids,
-    }, out_path)
-    print(f"  [genres] Saved: {genre_table.shape}, {n_genres} genres, "
-          f"{len(movie_genre_ids):,} movies with genre IDs")
+    tensor = torch.tensor(embeddings, dtype=torch.float32)
+    torch.save(tensor, SBERT_EMBEDDINGS_PATH)
+    log.info(f"  Saved SBERT embeddings → {SBERT_EMBEDDINGS_PATH}  shape={tuple(tensor.shape)}")
+    return tensor
 
 
-def _build_popularity(train_df: pd.DataFrame, n_movies: int):
-    out_path = PROCESSED_DIR / "popularity.pt"
-    if out_path.exists():
-        print("  [popularity] Already exists, skipping.")
-        return
+# ─────────────────────────────────────────────────────────────────────────────
+# Stream C — Popularity & user history embeddings
+# ─────────────────────────────────────────────────────────────────────────────
 
-    print("  [popularity] Computing item popularity ...")
+def build_popularity_features(
+    train_df:  pd.DataFrame,
+    n_movies:  int,
+) -> torch.Tensor:
+    """
+    Per-movie log-normalised interaction count from training data.
+    Shape: (n_movies,) — used as a scalar feature in the hybrid model.
+
+    Log normalisation prevents mega-popular movies from dominating;
+    a movie with 100k ratings vs 10k ratings shouldn't be 10× more important.
+    """
     counts = train_df["movie_idx"].value_counts()
-    pop = torch.zeros(n_movies)
-    for idx, cnt in counts.items():
-        if int(idx) < n_movies:
-            pop[int(idx)] = float(cnt)
+    pop = np.zeros(n_movies, dtype=np.float32)
+    for movie_idx, count in counts.items():
+        pop[int(movie_idx)] = count
 
-    # Normalise to [0, 1]
-    max_pop = pop.max()
-    if max_pop > 0:
-        pop = pop / max_pop
+    log_pop = np.log1p(pop)
+    log_pop /= log_pop.max()  # Scale to [0, 1]
 
-    torch.save(pop, out_path)
-    print(f"  [popularity] Saved: {pop.shape}")
-
-
-def _build_user_features(train_df: pd.DataFrame, n_users: int):
-    out_path = PROCESSED_DIR / "user_features.pt"
-    if out_path.exists():
-        print("  [user_features] Already exists, skipping.")
-        return
-
-    print("  [user_features] Computing user features ...")
-    # Features: mean_rating, rating_count (normalised)
-    user_stats = train_df.groupby("user_idx")["rating"].agg(["mean", "count"])
-    mean_ratings = torch.zeros(n_users)
-    rating_counts = torch.zeros(n_users)
-
-    for uid, row in user_stats.iterrows():
-        if int(uid) < n_users:
-            mean_ratings[int(uid)] = float(row["mean"])
-            rating_counts[int(uid)] = float(row["count"])
-
-    # Normalize counts
-    max_count = rating_counts.max()
-    if max_count > 0:
-        rating_counts = rating_counts / max_count
-
-    # Shape: (n_users, 2)
-    user_features = torch.stack([mean_ratings, rating_counts], dim=1)
-    torch.save(user_features, out_path)
-    print(f"  [user_features] Saved: {user_features.shape}")
+    tensor = torch.tensor(log_pop, dtype=torch.float32)
+    torch.save(tensor, POPULARITY_PATH)
+    log.info(f"  Saved popularity → {POPULARITY_PATH}  shape={tuple(tensor.shape)}")
+    return tensor
 
 
-def _build_history_embeddings(
-    train_df: pd.DataFrame, n_users: int, n_movies: int, sbert_emb: torch.Tensor
-):
-    out_path = PROCESSED_DIR / "history_embeddings.pt"
-    if out_path.exists():
-        print("  [history] Already exists, skipping.")
-        return
+def build_user_history_embeddings(
+    train_df:       pd.DataFrame,
+    sbert_embeddings: torch.Tensor,
+    n_users:        int,
+) -> torch.Tensor:
+    """
+    Per-user history embedding: mean of SBERT vectors of all movies the user
+    rated in training, weighted by rating (higher-rated movies contribute more).
 
-    print("  [history] Building user history embeddings ...")
-    embed_dim = sbert_emb.shape[1]
-    history_emb = torch.zeros(n_users, embed_dim)
+    Shape: (n_users, SBERT_DIM=384)
 
-    user_groups = train_df.groupby("user_idx")["movie_idx"].apply(list)
-    for uid, movie_indices in user_groups.items():
-        uid = int(uid)
-        if uid >= n_users:
+    This gives the hybrid model a content-aware user representation that
+    complements the collaborative latent factors — especially useful for
+    cold-start users who have few interactions.
+
+    Users with all-zero movie embeddings (no synopsis coverage) get a zero
+    history vector.
+    """
+    log.info("  Building user history embeddings...")
+    emb_np = sbert_embeddings.numpy()  # (n_movies, 384)
+
+    history = np.zeros((n_users, SBERT_DIM), dtype=np.float32)
+
+    # Group by user for efficiency
+    grouped = train_df.groupby("user_idx")
+    for user_idx, group in grouped:
+        movie_indices = group["movie_idx"].values.astype(int)
+        # Use raw ratings (not centered) as weights — range [0.5, 5.0]
+        weights = group["rating"].values.astype(np.float32)
+        weights = weights / weights.sum()  # Normalise weights
+
+        movie_embs = emb_np[movie_indices]  # (n_rated, 384)
+        history[int(user_idx)] = (movie_embs * weights[:, None]).sum(axis=0)
+
+    # L2 normalise non-zero rows
+    norms = np.linalg.norm(history, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)  # Avoid div by zero
+    history = history / norms
+
+    tensor = torch.tensor(history, dtype=torch.float32)
+    torch.save(tensor, HISTORY_EMBEDDINGS_PATH)
+    log.info(f"  Saved history embeddings → {HISTORY_EMBEDDINGS_PATH}  shape={tuple(tensor.shape)}")
+    return tensor
+
+
+def build_genre_table(movie_map: dict) -> torch.Tensor:
+    """
+    Build integer genre index tensor for embedding table lookup.
+    Shape: (n_movies,) — primary genre index per movie (0-indexed).
+
+    Multi-genre movies: primary genre = first genre listed in IMDB.
+    Movies with no genre: index = NUM_GENRES (out-of-vocab, gets a learned
+    fallback embedding in the model).
+    """
+    n_movies = len(movie_map)
+    genre_indices = np.full(n_movies, NUM_GENRES, dtype=np.int64)  # Default = OOV
+
+    links = pd.read_csv(ML_LINKS_PATH, usecols=["movieId", "imdbId"])
+    links["tconst"] = links["imdbId"].apply(
+        lambda x: f"tt{int(x):07d}" if pd.notna(x) else None
+    )
+    ml_id_to_tconst = dict(zip(links["movieId"], links["tconst"]))
+
+    basics = pd.read_csv(
+        IMDB_BASICS_PATH, sep="\t", na_values="\\N", low_memory=False,
+        usecols=["tconst", "titleType", "genres"],
+    )
+    basics = basics[basics["titleType"] == "movie"]
+    tconst_to_genres = dict(zip(basics["tconst"], basics["genres"].fillna("")))
+
+    for movie_id, movie_idx in movie_map.items():
+        tconst = ml_id_to_tconst.get(int(movie_id))
+        if tconst is None:
             continue
-        valid = [int(m) for m in movie_indices if int(m) < n_movies]
-        if valid:
-            history_emb[uid] = sbert_emb[valid].mean(dim=0)
+        genres_str = tconst_to_genres.get(tconst, "")
+        genres = [g for g in genres_str.split(",") if g in GENRE_TO_IDX]
+        if genres:
+            genre_indices[movie_idx] = GENRE_TO_IDX[genres[0]]
 
-    torch.save(history_emb, out_path)
-    print(f"  [history] Saved: {history_emb.shape}")
+    tensor = torch.tensor(genre_indices, dtype=torch.long)
+    torch.save(tensor, GENRE_TABLE_PATH)
+    log.info(f"  Saved genre table → {GENRE_TABLE_PATH}  shape={tuple(tensor.shape)}")
+    return tensor
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_feature_engineering(
+    movie_map: dict,
+    user_map:  dict,
+    train_df:  pd.DataFrame,
+    skip_sbert: bool = False,
+) -> dict[str, torch.Tensor]:
+    """
+    Run all three feature streams and return a dict of tensors.
+
+    Parameters
+    ----------
+    movie_map   : {movie_id → movie_idx}
+    user_map    : {user_id  → user_idx}
+    train_df    : training split DataFrame (with user_idx, movie_idx, rating)
+    skip_sbert  : if True, skip SBERT encoding (useful for fast iteration/testing)
+
+    Returns
+    -------
+    {
+        "imdb":    (n_movies, 23),
+        "sbert":   (n_movies, 384),
+        "pop":     (n_movies,),
+        "history": (n_users,  384),
+        "genre":   (n_movies,),
+    }
+    """
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    n_movies = len(movie_map)
+    n_users  = len(user_map)
+
+    log.info("\n" + "=" * 55)
+    log.info("Step 3 — Feature Engineering")
+    log.info("=" * 55)
+
+    log.info("\n[3a] Stream A: IMDB structured features")
+    imdb_tensor = build_imdb_features(movie_map)
+
+    log.info("\n[3b] Stream B: SBERT semantic embeddings")
+    if skip_sbert and SBERT_EMBEDDINGS_PATH.exists():
+        log.info("  Skipping SBERT encoding — loading cached embeddings")
+        sbert_tensor = torch.load(SBERT_EMBEDDINGS_PATH, weights_only=True)
+    else:
+        sbert_tensor = build_sbert_embeddings(movie_map)
+
+    log.info("\n[3c] Stream C: Popularity + user history + genre table")
+    pop_tensor     = build_popularity_features(train_df, n_movies)
+    history_tensor = build_user_history_embeddings(train_df, sbert_tensor, n_users)
+    genre_tensor   = build_genre_table(movie_map)
+
+    log.info("\n" + "=" * 55)
+    log.info("Feature engineering complete")
+    log.info(f"  imdb_features   : {tuple(imdb_tensor.shape)}")
+    log.info(f"  sbert_embeddings: {tuple(sbert_tensor.shape)}")
+    log.info(f"  popularity      : {tuple(pop_tensor.shape)}")
+    log.info(f"  history_embs    : {tuple(history_tensor.shape)}")
+    log.info(f"  genre_table     : {tuple(genre_tensor.shape)}")
+    log.info("=" * 55)
+
+    return {
+        "imdb":    imdb_tensor,
+        "sbert":   sbert_tensor,
+        "pop":     pop_tensor,
+        "history": history_tensor,
+        "genre":   genre_tensor,
+    }
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Run feature engineering")
+    parser.add_argument("--skip-sbert", action="store_true",
+                        help="Skip SBERT encoding and load cached embeddings if available")
+    args = parser.parse_args()
+
+    # Load preprocessed artifacts
+    movie_map_df = pd.read_csv(MOVIE_MAP_CSV)
+    user_map_df  = pd.read_csv(USER_MAP_CSV)
+    train_df     = pd.read_csv(TRAIN_CSV)
+
+    movie_map = dict(zip(movie_map_df["movie_id"], movie_map_df["movie_idx"]))
+    user_map  = dict(zip(user_map_df["user_id"],   user_map_df["user_idx"]))
+
+    run_feature_engineering(
+        movie_map=movie_map,
+        user_map=user_map,
+        train_df=train_df,
+        skip_sbert=args.skip_sbert,
+    )
