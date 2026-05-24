@@ -374,13 +374,13 @@ class BPR:
             "n_users":      self.model.user_embeddings.num_embeddings,
             "n_items":      self.model.item_embeddings.num_embeddings,
             "n_factors":    self.model.n_factors,
-            "loss_history": self.train_loss_history,
+            "loss_history": [float(x) for x in self.train_loss_history],
         }, path)
         log.info(f"BPR model saved → {path}")
 
     @classmethod
     def load(cls, path: Path = BPR_FACTORS_PATH, device: torch.device = DEVICE) -> "BPR":
-        ckpt = torch.load(path, map_location=device, weights_only=True)
+        ckpt = torch.load(path, map_location=device, weights_only=False)
         trainer = cls(
             n_users   = ckpt["n_users"],
             n_items   = ckpt["n_items"],
