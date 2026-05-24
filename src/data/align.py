@@ -32,8 +32,8 @@ except ModuleNotFoundError:
     # Fallback for direct execution: resolve paths relative to project root
     _ROOT = Path(__file__).resolve().parent.parent.parent
     NETFLIX_MOVIES_PATH = _ROOT / "data/raw/netflix/Netflix_Dataset_Movie.csv"
-    ML_MOVIES_PATH      = _ROOT / "data/raw/ml-25m/ml-25m/movies.csv"
-    ML_LINKS_PATH       = _ROOT / "data/raw/ml-25m/ml-25m/links.csv"
+    ML_MOVIES_PATH      = _ROOT / "data/raw/ml-25m/movies.csv"
+    ML_LINKS_PATH       = _ROOT / "data/raw/ml-25m/links.csv"
     IMDB_BASICS_PATH    = _ROOT / "data/raw/imdb/title.basics.tsv"
     TMDB_CSV_PATH       = _ROOT / "data/raw/tmdb/TMDB_movie_dataset_v11.csv"
     PROCESSED_DIR       = _ROOT / "data/processed"
