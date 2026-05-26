@@ -32,13 +32,14 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np
 import pandas as pd
+import pickle
 import torch
 from scipy import sparse
 
 from src.config import (
     PROCESSED_DIR, RESULTS_DIR, DEVICE,
     TRAIN_CSV, VAL_CSV,
-    CSR_MATRIX_PATH, BPR_DATA_PATH, USER_POSITIVES_PATH,
+    CSR_MATRIX_PATH, BPR_DATA_PATH, USER_POSITIVES_PATH, BPR_SAMPLES_PER_EPOCH,
     SBERT_EMBEDDINGS_PATH, IMDB_FEATURES_PATH,
     POPULARITY_PATH, HISTORY_EMBEDDINGS_PATH,
     ALS_PATH,
@@ -206,22 +207,30 @@ def train_hybrid(
     skip_if_exists: bool  = False,
     embed_dim:      int   = None,
     n_heads:        int   = None,
-    lr:             float = LR_PATH_A,
+    lr:             float = LR_PATH_B,
     freeze_epochs:  int   = 5,
 ) -> HybridTrainer:
-    _banner("Hybrid — CF + Content End-to-End Model")
+    _banner("Hybrid — CF + Content Model (BPR ranking loss)")
 
     if skip_if_exists and HYBRID_CKPT_PATH.exists():
-        log.info(f"Hybrid checkpoint found at {HYBRID_CKPT_PATH} — skipping training.")
+        log.info(f"Hybrid checkpoint found — skipping.")
         return None
 
     from src.config import EMBED_DIM_D, NUM_HEADS
     embed_dim = embed_dim or EMBED_DIM_D
     n_heads   = n_heads   or NUM_HEADS
 
-    train_df, val_df = _load_splits()
+    train_df, _  = _load_splits()
     n_users, n_items = _get_dims(train_df)
     tensors = _load_feature_tensors()
+
+    # Load BPR training data for hybrid triplet sampling
+    log.info("Loading BPR triplet data for Hybrid...")
+    bpr_data = np.load(BPR_DATA_PATH)
+    all_items = bpr_data["all_items"]
+    item_pop  = bpr_data["item_pop_values"]
+    with open(USER_POSITIVES_PATH, "rb") as f:
+        user_positives = pickle.load(f)
 
     hybrid_model = HybridModel(
         n_users   = n_users,
@@ -231,7 +240,6 @@ def train_hybrid(
     )
     log.info(repr(hybrid_model))
 
-    # Inject pre-trained CF factors
     hybrid_model.load_cf_weights(
         user_factors = als_model.get_user_factors_tensor(),
         item_factors = als_model.get_item_factors_tensor(),
@@ -240,22 +248,26 @@ def train_hybrid(
     )
 
     trainer = HybridTrainer(
-        model         = hybrid_model,
-        sbert_emb     = tensors["sbert"],
-        imdb_feats    = tensors["imdb"],
-        popularity    = tensors["pop"],
-        history_emb   = tensors["history"],
-        device        = DEVICE,
-        lr            = lr,
-        weight_decay  = WEIGHT_DECAY,
-        n_epochs      = MAX_EPOCHS,
-        batch_size    = BATCH_SIZE,
-        patience      = EARLY_STOP_PATIENCE,
-        freeze_epochs = freeze_epochs,
+        model             = hybrid_model,
+        sbert_emb         = tensors["sbert"],
+        imdb_feats        = tensors["imdb"],
+        popularity        = tensors["pop"],
+        history_emb       = tensors["history"],
+        user_positives    = user_positives,
+        all_items         = all_items,
+        item_pop          = item_pop,
+        device            = DEVICE,
+        lr                = lr,
+        weight_decay      = WEIGHT_DECAY,
+        n_epochs          = MAX_EPOCHS,
+        batch_size        = BATCH_SIZE,
+        samples_per_epoch = BPR_SAMPLES_PER_EPOCH,
+        patience          = EARLY_STOP_PATIENCE,
+        freeze_epochs     = freeze_epochs,
     )
-    trainer.fit(train_df, val_df)
+    trainer.fit()
 
-    log.info(f"\nHybrid complete — best val RMSE: {trainer.best_val_rmse:.5f}")
+    log.info(f"\nHybrid complete — best val loss: {trainer.best_val_loss:.5f}")
     return trainer
 
 
@@ -385,8 +397,8 @@ def _summary(
         log.info(f"║  BPR    final loss       : "
                  f"{bpr.train_loss_history[-1]:.5f}{'':>27}║")
     if hybrid:
-        log.info(f"║  Hybrid best val RMSE    : "
-                 f"{hybrid.best_val_rmse:.5f}{'':>27}║")
+        log.info(f"║  Hybrid best val loss    : "
+                 f"{hybrid.best_val_loss:.5f}{'':>27}║")
     log.info("╠══════════════════════════════════════════════════════╣")
     log.info("║  Saved checkpoints:                                   ║")
     for label, path in [

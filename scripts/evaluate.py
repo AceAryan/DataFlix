@@ -2,18 +2,31 @@
 DataFlix — Evaluation Script
 scripts/evaluate.py
 
-Fixes vs original:
-  1. Relevant items = movies rated ABOVE user mean (rating_centered > 0)
-     not ALL rated movies — prevents trivially near-zero NDCG
-  2. ALS scorer uses explicit dot product + biases (no double mean subtraction)
-  3. Cold-start users built from training counts at runtime (not stale CSV)
-  4. Feature tensors preloaded to GPU once for hybrid eval (was 7hr, now ~30min)
-  5. Results saved immediately after each model (no data loss on Ctrl+C)
-  6. User ID lookup pre-built as dict (was O(n) DataFrame scan per user)
+Model evaluation roles:
+  ALS    — rating prediction baseline only (RMSE/MAE)
+             ALS is explicit feedback MF trained to predict ratings.
+             It is NOT evaluated on ranking metrics — ranking unseen items
+             is not what ALS was designed for. Its value is as a baseline
+             for rating accuracy and as a warm-start for BPR/Hybrid.
+
+  BPR    — ranking model (NDCG, Recall, MRR + RMSE)
+             Trained with pairwise ranking loss. Evaluated on ranking
+             metrics with seen-item exclusion (standard implicit feedback
+             evaluation protocol).
+
+  Hybrid — ranking + content model (NDCG, Recall, MRR + RMSE)
+             Trained with BPR loss + content features. Same evaluation
+             protocol as BPR. Should outperform BPR especially on cold
+             users where content features compensate for sparse CF signal.
+
+Relevant items definition:
+  A test item is relevant if raw rating >= 4.0 (user genuinely liked it).
+  Using centred ratings as relevance signal was incorrect — a 4-star rating
+  from a generous user (mean=4.5) would be centred to -0.5 and excluded.
 
 Usage:
-  python scripts/evaluate.py                    # all models on test split
-  python scripts/evaluate.py --model als
+  python scripts/evaluate.py                    # all models
+  python scripts/evaluate.py --model als        # ALS rating metrics only
   python scripts/evaluate.py --model bpr
   python scripts/evaluate.py --model hybrid
   python scripts/evaluate.py --split val
@@ -54,15 +67,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-EVAL_REPORT_JSON  = RESULTS_DIR / "evaluation_report.json"
-EVAL_REPORT_CSV   = RESULTS_DIR / "evaluation_report.csv"
+EVAL_REPORT_JSON = RESULTS_DIR / "evaluation_report.json"
+EVAL_REPORT_CSV  = RESULTS_DIR / "evaluation_report.csv"
 
-# Items with rating_centered > this are "relevant" for ranking metrics.
-# 0.0 means "rated above the user's own mean" — a fair positive signal.
-RELEVANCE_THRESHOLD = 0.0
+# Rating threshold for relevance — items rated >= this are "liked"
+RELEVANCE_THRESHOLD = 4.0
 
-# Cold threshold used at eval time — higher than COLD_START_THRESHOLD in
-# config (which was used during preprocessing) so we actually catch users.
+# Cold threshold — users with fewer train ratings than this are "cold"
 COLD_EVAL_THRESHOLD = max(COLD_START_THRESHOLD, 20)
 
 
@@ -105,36 +116,27 @@ def _load_eval_data(split: str):
     eval_df  = pd.read_csv(csv)
     train_df = pd.read_csv(TRAIN_CSV)
 
-    # Build cold users from actual training counts — stale CSV used threshold=5
     train_counts = train_df.groupby("user_idx").size()
     cold_users   = set(train_counts[train_counts < COLD_EVAL_THRESHOLD].index.tolist())
-
-    log.info(f"  Eval  : {len(eval_df):,} ratings")
-    log.info(f"  Train : {len(train_df):,} ratings")
-    log.info(f"  Cold  : {len(cold_users):,} users (< {COLD_EVAL_THRESHOLD} train ratings)")
+    log.info(f"  Eval  : {len(eval_df):,} | Train: {len(train_df):,} | "
+             f"Cold users: {len(cold_users):,}")
     return eval_df, train_df, cold_users
 
 
 def _build_ground_truth(eval_df, train_df):
     """
-    user_relevant : items user rated >= 4.0 stars — true positives for ranking
-    user_seen     : all training items — excluded from recommendation
-    user_ratings  : all (movie_idx, rating_centered) pairs for RMSE
-    user_means    : per-user mean rating from training (for ALS de-centering)
+    user_relevant : items rated >= 4.0 in test — positive signal for ranking
+    user_seen     : all training items — excluded from ranking recommendations
+    user_ratings  : all (movie_idx, rating_centered) — for RMSE computation
     """
-    user_means    = train_df.groupby("user_idx")["rating"].mean().to_dict()
-
     user_relevant: dict[int, set]  = defaultdict(set)
     user_ratings:  dict[int, list] = defaultdict(list)
 
     for row in eval_df.itertuples(index=False):
-        uid, mid, rc = int(row.user_idx), int(row.movie_idx), float(row.rating_centered)
-        user_ratings[uid].append((mid, rc))
-        # Use raw rating as relevance signal — centred ratings are noisy
-        # for users with few test items (a 4-star from a generous rater
-        # might be centred to -0.5 but is still a genuinely liked item)
-        raw_rating = float(row.rating)
-        if raw_rating >= 4.0:
+        uid = int(row.user_idx)
+        mid = int(row.movie_idx)
+        user_ratings[uid].append((mid, float(row.rating_centered)))
+        if float(row.rating) >= RELEVANCE_THRESHOLD:
             user_relevant[uid].add(mid)
 
     user_seen: dict[int, set] = defaultdict(set)
@@ -143,10 +145,8 @@ def _build_ground_truth(eval_df, train_df):
 
     n_with = len(user_relevant)
     n_all  = len(user_ratings)
-    log.info(f"  Users with ≥1 relevant test item: {n_with:,} / {n_all:,} "
-             f"({n_all - n_with:,} skipped)")
-
-    return dict(user_relevant), dict(user_seen), dict(user_ratings), user_means
+    log.info(f"  Users with >=1 relevant test item: {n_with:,} / {n_all:,}")
+    return dict(user_relevant), dict(user_seen), dict(user_ratings)
 
 
 def _load_feature_tensors():
@@ -159,24 +159,6 @@ def _load_feature_tensors():
 
 
 # ── Scorers ───────────────────────────────────────────────────────────────────
-
-def _score_als(model: ALS, user_idx: int, seen: set,
-               user_mean: float = 0.0) -> np.ndarray:
-    """
-    score(u,i) = p_u · q_i + b_i + b_u + user_mean
-    Adding user_mean back converts centred predictions to absolute scale.
-    Without this, items a user likes score near 0 (not near 4-5),
-    making ranking essentially random.
-    """
-    scores = (model.item_factors @ model.user_factors[user_idx]
-              + model.item_biases
-              + model.user_biases[user_idx]
-              + user_mean)
-    if seen:
-        scores = scores.copy()
-        scores[list(seen)] = -np.inf
-    return scores
-
 
 def _score_bpr(model: BPR, user_idx: int, seen: set) -> np.ndarray:
     with torch.no_grad():
@@ -201,21 +183,87 @@ def _score_hybrid(model: HybridModel, user_idx: int,
     return scores
 
 
-# ── Evaluation loop ───────────────────────────────────────────────────────────
+# ── ALS rating evaluation (no ranking) ───────────────────────────────────────
 
-def evaluate_model(model_name, score_fn, eval_df, train_df,
-                   cold_users, k_values=TOP_K_VALUES) -> dict:
+def evaluate_als_ratings(als: ALS, eval_df: pd.DataFrame,
+                         train_df: pd.DataFrame, cold_users: set) -> dict:
+    """
+    Evaluate ALS on rating prediction only (RMSE and MAE).
+    ALS is an explicit feedback model — it predicts ratings, not rankings.
+    Ranking metrics are not reported for ALS.
+    """
+    log.info("  Computing ALS rating metrics (RMSE/MAE only)...")
 
-    user_relevant, user_seen, user_ratings, user_means = _build_ground_truth(eval_df, train_df)
-
-    # Pre-build user_id lookup — O(1) vs O(n) DataFrame scan per user
-    # (kept for potential future use; source segmentation removed with NF drop)
+    # Build user_id lookup for segment detection
     uid_lookup = (
         eval_df[["user_idx", "user_id"]].drop_duplicates("user_idx")
         .set_index("user_idx")["user_id"].to_dict()
     )
 
-    # NF segment removed — Netflix dropped due to 5.9% movie coverage
+    segments = ["overall", "warm", "cold"]
+    rmse_acc = {seg: [] for seg in segments}
+    mae_acc  = {seg: [] for seg in segments}
+    n_acc    = {seg: 0  for seg in segments}
+
+    grouped = eval_df.groupby("user_idx")
+    for user_idx, group in grouped:
+        user_idx = int(user_idx)
+        warmth   = "cold" if user_idx in cold_users else "warm"
+        segs     = ["overall", warmth]
+
+        movie_ids = group["movie_idx"].values.astype(int)
+        true_rc   = group["rating_centered"].values.astype(np.float32)
+
+        # ALS predicts mean-centred ratings directly
+        pred_rc = np.array([
+            als.predict(user_idx, mid) for mid in movie_ids
+        ], dtype=np.float32)
+
+        rmse = float(np.sqrt(np.mean((true_rc - pred_rc) ** 2)))
+        mae  = float(np.mean(np.abs(true_rc - pred_rc)))
+
+        for seg in segs:
+            rmse_acc[seg].append(rmse)
+            mae_acc[seg].append(mae)
+            n_acc[seg] += 1
+
+    results = {}
+    for seg in segments:
+        if rmse_acc[seg]:
+            results[seg] = {
+                "rmse":    float(np.mean(rmse_acc[seg])),
+                "mae":     float(np.mean(mae_acc[seg])),
+                "n_users": n_acc[seg],
+                "note":    "ALS evaluated on rating prediction only — not a ranking model",
+            }
+        else:
+            results[seg] = {"n_users": 0}
+
+    return results
+
+
+# ── Ranking evaluation (BPR + Hybrid) ────────────────────────────────────────
+
+def evaluate_ranking(
+    model_name: str,
+    score_fn,
+    eval_df:    pd.DataFrame,
+    train_df:   pd.DataFrame,
+    cold_users: set,
+    k_values:   list = TOP_K_VALUES,
+) -> dict:
+    """
+    Full ranking + rating evaluation for BPR and Hybrid.
+    Uses seen-item exclusion (standard implicit feedback protocol).
+    Only users with >= 1 relevant test item contribute to ranking metrics.
+    """
+    user_relevant, user_seen, user_ratings = _build_ground_truth(eval_df, train_df)
+
+    uid_lookup = (
+        eval_df[["user_idx", "user_id"]].drop_duplicates("user_idx")
+        .set_index("user_idx")["user_id"].to_dict()
+    )
+
     segments = ["overall", "warm", "cold"]
     accum = {seg: defaultdict(list) for seg in segments}
 
@@ -239,6 +287,7 @@ def evaluate_model(model_name, score_fn, eval_df, train_df,
         top_max = max(k_values)
         if np.isfinite(scores).sum() < top_max:
             continue
+
         top_idx = np.argpartition(scores, -top_max)[-top_max:]
         top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
 
@@ -248,7 +297,7 @@ def evaluate_model(model_name, score_fn, eval_df, train_df,
                 accum[seg][f"recall@{k}"].append(recall_at_k(top_idx, relevant, k))
                 accum[seg][f"mrr@{k}"].append(mrr_at_k(top_idx, relevant, k))
 
-        # Rating metrics on all test items
+        # Rating metrics
         pairs = user_ratings.get(user_idx, [])
         if pairs:
             true_r = np.array([r for _, r in pairs], dtype=np.float32)
@@ -275,7 +324,20 @@ def evaluate_model(model_name, score_fn, eval_df, train_df,
 
 # ── Reporting ─────────────────────────────────────────────────────────────────
 
-def _print_results(name, results, k_values):
+def _print_als(results: dict) -> None:
+    log.info("\n  ── ALS (rating prediction baseline) ──")
+    log.info(f"  {'Segment':<10}  {'RMSE':<10}  {'MAE':<10}  {'N':<10}")
+    log.info("  " + "─" * 44)
+    for seg in ["overall", "warm", "cold"]:
+        m = results.get(seg, {})
+        if not m or m.get("n_users", 0) == 0:
+            continue
+        log.info(f"  {seg:<10}  {m.get('rmse', float('nan')):<10.4f}  "
+                 f"{m.get('mae', float('nan')):<10.4f}  {m.get('n_users', 0):<10,}")
+    log.info("  (Ranking metrics not reported for ALS — see module docstring)")
+
+
+def _print_ranking(name: str, results: dict, k_values: list) -> None:
     log.info(f"\n  ── {name} ──")
     hdr = f"  {'Segment':<10}" + "".join(
         f"  {'NDCG@'+str(k):<10}{'Recall@'+str(k):<12}{'MRR@'+str(k):<10}"
@@ -298,7 +360,7 @@ def _print_results(name, results, k_values):
         log.info(row)
 
 
-def _save_results(new_results):
+def _save_results(new_results: dict) -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     existing = {}
     if EVAL_REPORT_JSON.exists():
@@ -315,22 +377,27 @@ def _save_results(new_results):
     log.info(f"  Saved → {EVAL_REPORT_JSON.name}  &  {EVAL_REPORT_CSV.name}")
 
 
-def _print_comparison(all_results, k=10):
+def _print_comparison(all_results: dict) -> None:
+    k = 10
     log.info("")
-    log.info("╔══════════════════════════════════════════════════════╗")
-    log.info("║  Model Comparison — overall, test split               ║")
-    log.info("╠══════════════════╦═════════╦══════════╦══════════════╣")
-    log.info("║  Model           ║ NDCG@10 ║ Recall@10║ RMSE         ║")
-    log.info("╠══════════════════╬═════════╬══════════╬══════════════╣")
+    log.info("╔══════════════════════════════════════════════════════════════╗")
+    log.info("║  Model Comparison — overall, test split                       ║")
+    log.info("╠══════════════╦══════════╦══════════╦════════╦════════════════╣")
+    log.info("║  Model       ║ NDCG@10  ║ Recall@10║ RMSE   ║ Notes          ║")
+    log.info("╠══════════════╬══════════╬══════════╬════════╬════════════════╣")
     for name, res in all_results.items():
         m = res.get("overall", {})
+        ndcg   = m.get(f"ndcg@{k}", None)
+        recall = m.get(f"recall@{k}", None)
+        rmse   = m.get("rmse", None)
+        note   = "rating only" if ndcg is None else ""
         log.info(
-            f"║  {name:<16}║ "
-            f"{m.get(f'ndcg@{k}', float('nan')):<7.4f} ║ "
-            f"{m.get(f'recall@{k}', float('nan')):<8.4f} ║ "
-            f"{m.get('rmse', float('nan')):<12.4f} ║"
+            f"║  {name:<12}║ "
+            f"{'N/A':<8} ║ " if ndcg is None else
+            f"║  {name:<12}║ {ndcg:<8.4f} ║ {recall:<8.4f} ║ "
+            f"{rmse:<6.4f} ║ {note:<14} ║"
         )
-    log.info("╚══════════════════╩═════════╩══════════╩══════════════╝")
+    log.info("╚══════════════╩══════════╩══════════╩════════╩════════════════╝")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -340,27 +407,23 @@ def main(args):
     t0 = time.time()
 
     eval_df, train_df, cold_users = _load_eval_data(args.split)
-    run_all = args.model is None
+    run_all     = args.model is None
     all_results = {}
-    tensors = None
+    tensors     = None
 
-    # ALS
+    # ALS — rating metrics only
     if run_all or args.model == "als":
         if not ALS_PATH.exists():
             log.warning("ALS factors not found — skipping.")
         else:
-            log.info("\nEvaluating ALS...")
-            als = ALS.load(ALS_PATH)
-            user_means_als = train_df.groupby("user_idx")["rating"].mean().to_dict()
-            results = evaluate_model(
-                "ALS", lambda u, s: _score_als(als, u, s, user_means_als.get(u, 0.0)),
-                eval_df, train_df, cold_users
-            )
-            _print_results("ALS", results, TOP_K_VALUES)
+            log.info("\nEvaluating ALS (rating prediction)...")
+            als     = ALS.load(ALS_PATH)
+            results = evaluate_als_ratings(als, eval_df, train_df, cold_users)
+            _print_als(results)
             all_results["ALS"] = results
             _save_results({"ALS": results})
 
-    # BPR
+    # BPR — full ranking + rating
     if run_all or args.model == "bpr":
         if not BPR_FACTORS_PATH.exists():
             log.warning("BPR factors not found — skipping.")
@@ -368,15 +431,16 @@ def main(args):
             log.info("\nEvaluating BPR...")
             bpr = BPR.load(BPR_FACTORS_PATH, device=DEVICE)
             bpr.model.eval()
-            results = evaluate_model(
-                "BPR", lambda u, s: _score_bpr(bpr, u, s),
-                eval_df, train_df, cold_users
+            results = evaluate_ranking(
+                "BPR",
+                lambda u, s: _score_bpr(bpr, u, s),
+                eval_df, train_df, cold_users,
             )
-            _print_results("BPR", results, TOP_K_VALUES)
+            _print_ranking("BPR", results, TOP_K_VALUES)
             all_results["BPR"] = results
             _save_results({"BPR": results})
 
-    # Hybrid
+    # Hybrid — full ranking + rating
     if run_all or args.model == "hybrid":
         if not HYBRID_CKPT_PATH.exists():
             log.warning("Hybrid checkpoint not found — skipping.")
@@ -388,11 +452,12 @@ def main(args):
             hybrid.eval()
             log.info("  Preloading tensors to GPU...")
             gpu_t = {k: v.to(DEVICE) for k, v in tensors.items()}
-            results = evaluate_model(
-                "Hybrid", lambda u, s: _score_hybrid(hybrid, u, gpu_t, s),
-                eval_df, train_df, cold_users
+            results = evaluate_ranking(
+                "Hybrid",
+                lambda u, s: _score_hybrid(hybrid, u, gpu_t, s),
+                eval_df, train_df, cold_users,
             )
-            _print_results("Hybrid", results, TOP_K_VALUES)
+            _print_ranking("Hybrid", results, TOP_K_VALUES)
             all_results["Hybrid"] = results
             _save_results({"Hybrid": results})
 
@@ -404,7 +469,7 @@ def main(args):
 
 
 def _parse_args():
-    p = argparse.ArgumentParser(description="DataFlix evaluation pipeline")
+    p = argparse.ArgumentParser(description="DataFlix evaluation")
     p.add_argument("--model", choices=["als", "bpr", "hybrid"], default=None)
     p.add_argument("--split", choices=["val", "test"], default="test")
     return p.parse_args()
