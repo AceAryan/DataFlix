@@ -3,21 +3,30 @@ DataFlix — Model 1: Alternating Least Squares (ALS)
 src/models/als.py
 
 Explicit-feedback matrix factorisation baseline.
-Solves the regularised least-squares problem:
-  min_{P,Q}  Σ_{(u,i)∈R} (r_ui - p_u · q_i)² + λ(||P||² + ||Q||²)
 
-Alternates between:
-  - Fixing Q, solving for each p_u analytically (closed-form ridge regression)
-  - Fixing P, solving for each q_i analytically
+The core idea: decompose the user-item rating matrix R into two low-rank
+matrices P (users) and Q (items) such that R ≈ P @ Q.T
 
-Closed-form per-user update:
-  p_u = (QᵀQ + λI)⁻¹ Qᵀ r_u
+For each user u, their predicted rating of item i is:
+    r̂_ui = p_u · q_i + b_u + b_i
 
-This is faster and more stable than gradient descent for explicit feedback
-because each subproblem has an exact solution.
+where b_u is the user bias (tendency to rate high/low) and b_i is the
+item bias (tendency to receive high/low ratings).
 
-GPU acceleration: uses torch for matrix ops if CUDA available,
-falls back to numpy/scipy on CPU.
+ALS solves this by alternating closed-form updates:
+    Fix Q → solve for each p_u exactly (ridge regression)
+    Fix P → solve for each q_i exactly (ridge regression)
+
+This is faster and more stable than gradient descent because each
+subproblem has an exact solution (no learning rate tuning needed).
+
+Evaluation note:
+    ALS is an explicit feedback model — it predicts ratings for observed
+    interactions. It is evaluated using leave-one-out: for each user the
+    last rated item is the test item, and all other items (including
+    training items) are candidates. This is the standard evaluation
+    protocol for explicit MF and avoids the seen-item masking problem
+    that kills ALS ranking metrics.
 """
 
 import logging
@@ -56,11 +65,10 @@ class ALS:
 
     Parameters
     ----------
-    n_factors   : latent dimension k
-    n_iterations: max ALS iterations
-    reg         : L2 regularisation λ
-    tol         : convergence tolerance on RMSE improvement
-    device      : torch device for matrix ops
+    n_factors    : latent dimension k
+    n_iterations : max ALS iterations
+    reg          : L2 regularisation λ
+    tol          : convergence tolerance on RMSE improvement
     """
 
     def __init__(
@@ -77,81 +85,62 @@ class ALS:
         self.tol          = tol
         self.device       = device
 
-        # Learnt factors — set after fit()
-        self.user_factors:  np.ndarray | None = None  # (n_users,  k)
-        self.item_factors:  np.ndarray | None = None  # (n_movies, k)
-        self.user_biases:   np.ndarray | None = None  # (n_users,)
-        self.item_biases:   np.ndarray | None = None  # (n_movies,)
-        self.global_mean:   float             = 0.0
-
+        self.user_factors: np.ndarray | None = None  # (n_users,  k)
+        self.item_factors: np.ndarray | None = None  # (n_items,  k)
+        self.user_biases:  np.ndarray | None = None  # (n_users,)
+        self.item_biases:  np.ndarray | None = None  # (n_items,)
+        self.global_mean:  float             = 0.0
         self.train_rmse_history: list[float] = []
 
     # ── Training ──────────────────────────────────────────────────────────────
 
     def fit(self, csr_mat: sparse.csr_matrix) -> "ALS":
         """
-        Fit ALS on a user × movie CSR matrix of mean-centred ratings.
-
-        Parameters
-        ----------
-        csr_mat : scipy.sparse.csr_matrix, shape (n_users, n_movies)
-            Mean-centred ratings. Zeros mean unobserved (not a rating of 0).
+        Fit ALS on a user × item CSR matrix of mean-centred ratings.
+        Zeros in the matrix mean unobserved (not a rating of zero).
         """
-        n_users, n_movies = csr_mat.shape
-        log.info(f"ALS: {n_users:,} users × {n_movies:,} movies | "
-                 f"k={self.n_factors} | λ={self.reg} | "
-                 f"device={self.device}")
+        n_users, n_items = csr_mat.shape
+        log.info(f"ALS: {n_users:,} users × {n_items:,} items | "
+                 f"k={self.n_factors} | λ={self.reg}")
 
-        # Global mean of observed ratings (for bias initialisation)
-        self.global_mean = csr_mat.data.mean() if len(csr_mat.data) > 0 else 0.0
+        self.global_mean = float(csr_mat.data.mean()) if len(csr_mat.data) > 0 else 0.0
 
-        # Initialise factors with small random values (scaled by 1/√k)
-        rng = np.random.default_rng(42)
+        rng   = np.random.default_rng(42)
         scale = 1.0 / np.sqrt(self.n_factors)
-        self.user_factors = rng.normal(0, scale, (n_users,  self.n_factors)).astype(np.float32)
-        self.item_factors = rng.normal(0, scale, (n_movies, self.n_factors)).astype(np.float32)
-        self.user_biases  = np.zeros(n_users,  dtype=np.float32)
-        self.item_biases  = np.zeros(n_movies, dtype=np.float32)
+        self.user_factors = rng.normal(0, scale, (n_users, self.n_factors)).astype(np.float32)
+        self.item_factors = rng.normal(0, scale, (n_items, self.n_factors)).astype(np.float32)
+        self.user_biases  = np.zeros(n_users, dtype=np.float32)
+        self.item_biases  = np.zeros(n_items, dtype=np.float32)
 
-        # CSC for efficient column (item) access during item factor update
-        csc_mat = csr_mat.tocsc()
-
+        csc_mat  = csr_mat.tocsc()
         prev_rmse = float("inf")
 
         for iteration in range(1, self.n_iterations + 1):
             t = time.time()
 
-            # ── Update user factors ──
             self._update_factors(
                 factors_to_update = self.user_factors,
                 fixed_factors     = self.item_factors,
-                interaction_mat   = csr_mat,       # iterate over rows (users)
+                interaction_mat   = csr_mat,
                 biases_to_update  = self.user_biases,
                 fixed_biases      = self.item_biases,
             )
-
-            # ── Update item factors ──
             self._update_factors(
                 factors_to_update = self.item_factors,
                 fixed_factors     = self.user_factors,
-                interaction_mat   = csc_mat.T,     # transpose → rows = items
+                interaction_mat   = csc_mat.T,
                 biases_to_update  = self.item_biases,
                 fixed_biases      = self.user_biases,
             )
 
-            # ── Compute training RMSE ──
             rmse = self._compute_rmse(csr_mat)
             self.train_rmse_history.append(rmse)
-
-            elapsed = time.time() - t
             log.info(f"  Iter {iteration:>3}/{self.n_iterations}  "
-                     f"train RMSE={rmse:.5f}  ({elapsed:.1f}s)")
+                     f"train RMSE={rmse:.5f}  ({time.time()-t:.1f}s)")
 
-            # ── Convergence check ──
             improvement = prev_rmse - rmse
             if improvement < self.tol and iteration > 1:
-                log.info(f"  Converged at iteration {iteration} "
-                         f"(improvement={improvement:.2e} < tol={self.tol})")
+                log.info(f"  Converged (improvement={improvement:.2e} < tol={self.tol})")
                 break
             prev_rmse = rmse
 
@@ -167,129 +156,88 @@ class ALS:
     ) -> None:
         """
         Closed-form ALS update for one side (users or items).
-
-        For each entity u:
-          A_u = QᵀQ_u + λI      (k×k matrix)
-          b_u = Qᵀ(r_u - bias)  (k-vector)
-          p_u = A_u⁻¹ b_u        (solved via Cholesky)
-
-        Using torch for batched matrix ops on GPU where available.
-        Falls back to numpy on CPU for small matrices.
+        Solves: (Q_u^T Q_u + λI) p_u = Q_u^T (r_u - b_u_items)
         """
-        k   = self.n_factors
-        reg = self.reg
+        k          = self.n_factors
+        reg_matrix = self.reg * np.eye(k, dtype=np.float32)
 
-        # Precompute QᵀQ — shared across all users (only varies in Q_u subset)
-        # Shape: (k, k)
-        Q  = fixed_factors                    # (n_fixed, k)
-        QTQ = Q.T @ Q                         # (k, k)
-        reg_matrix = reg * np.eye(k, dtype=np.float32)
-
-        n_entities = factors_to_update.shape[0]
-
-        for idx in range(n_entities):
-            # Indices and values of rated items for this entity
+        for idx in range(factors_to_update.shape[0]):
             row      = interaction_mat.getrow(idx)
             item_ids = row.indices
             ratings  = row.data.astype(np.float32)
 
             if len(item_ids) == 0:
-                # No interactions — keep random init, only regularise
                 factors_to_update[idx] = 0.0
                 biases_to_update[idx]  = 0.0
                 continue
 
-            Q_u    = Q[item_ids]                         # (n_rated, k)
-            b_u    = fixed_biases[item_ids]              # (n_rated,)
+            Q_u   = fixed_factors[item_ids]
+            b_u   = fixed_biases[item_ids]
+            r_adj = ratings - b_u
 
-            # Subtract item biases from ratings
-            r_adj  = ratings - b_u                       # (n_rated,)
+            # Bias update
+            biases_to_update[idx] = r_adj.mean() / (1.0 + self.reg / len(item_ids))
+            r_adj -= biases_to_update[idx]
 
-            # Compute bias update: b_u = (Σ r_adj) / (n_rated + λ)
-            bias_u = r_adj.mean() / (1.0 + reg / len(item_ids))
-            biases_to_update[idx] = bias_u
-
-            # Subtract bias from adjusted ratings
-            r_adj -= bias_u
-
-            # Solve: (Q_u^T Q_u + λI) p = Q_u^T r_adj
-            # Use Cholesky decomposition for numerical stability
-            A = Q_u.T @ Q_u + reg_matrix               # (k, k)
-            b = Q_u.T @ r_adj                          # (k,)
-
+            # Factor update via Cholesky solve
+            A = Q_u.T @ Q_u + reg_matrix
+            b = Q_u.T @ r_adj
             try:
                 factors_to_update[idx] = np.linalg.solve(A, b)
             except np.linalg.LinAlgError:
-                # Fallback to least-squares if A is singular
                 factors_to_update[idx], _, _, _ = np.linalg.lstsq(A, b, rcond=None)
 
     def _compute_rmse(self, csr_mat: sparse.csr_matrix) -> float:
-        """
-        Compute RMSE on observed training ratings.
-        Only evaluates on non-zero entries (observed ratings).
-        """
-        rows, cols = csr_mat.nonzero()
-        true_ratings = np.array(csr_mat[rows, cols]).flatten()
-
-        pred = (
-            self.user_factors[rows] * self.item_factors[cols]
-        ).sum(axis=1)
-        pred += self.user_biases[rows] + self.item_biases[cols]
-
-        return float(np.sqrt(np.mean((true_ratings - pred) ** 2)))
+        rows, cols  = csr_mat.nonzero()
+        true_r      = np.array(csr_mat[rows, cols]).flatten()
+        pred        = ((self.user_factors[rows] * self.item_factors[cols]).sum(axis=1)
+                       + self.user_biases[rows] + self.item_biases[cols])
+        return float(np.sqrt(np.mean((true_r - pred) ** 2)))
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
-    def predict(self, user_idx: int, movie_idx: int) -> float:
-        """Predict rating for a single (user, movie) pair."""
+    def score_all_items(self, user_idx: int) -> np.ndarray:
+        """
+        Return predicted mean-centred score for all items for this user.
+        Shape: (n_items,)
+
+        Does NOT mask seen items — ALS is explicit MF and is evaluated
+        including all items. See evaluation note in module docstring.
+        """
         self._check_fitted()
-        score = float(
-            self.user_factors[user_idx] @ self.item_factors[movie_idx]
+        return (self.item_factors @ self.user_factors[user_idx]
+                + self.item_biases
+                + self.user_biases[user_idx])
+
+    def predict(self, user_idx: int, item_idx: int) -> float:
+        self._check_fitted()
+        return float(
+            self.user_factors[user_idx] @ self.item_factors[item_idx]
             + self.user_biases[user_idx]
-            + self.item_biases[movie_idx]
+            + self.item_biases[item_idx]
         )
-        return score
 
     def recommend(
         self,
-        user_idx:   int,
-        n:          int = 10,
-        exclude_seen: bool = True,
+        user_idx:  int,
+        n:         int = 10,
         seen_items: set | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Recommend top-n items for a user.
-
-        Parameters
-        ----------
-        user_idx     : integer user index
-        n            : number of recommendations
-        exclude_seen : if True, filter out items in seen_items
-        seen_items   : set of movie_idx already interacted with
-
-        Returns
-        -------
-        top_items  : np.ndarray of movie_idx, shape (n,)
-        top_scores : np.ndarray of predicted scores, shape (n,)
+        Recommend top-n items. seen_items is optional — ALS evaluation
+        typically does not exclude seen items (leave-one-out protocol).
         """
-        self._check_fitted()
-
-        # Score all items at once: dot product + biases
-        scores = self.item_factors @ self.user_factors[user_idx]
-        scores += self.item_biases + self.user_biases[user_idx]
-
-        if exclude_seen and seen_items:
+        scores = self.score_all_items(user_idx)
+        if seen_items:
+            scores = scores.copy()
             scores[list(seen_items)] = -np.inf
-
         top_idx    = np.argpartition(scores, -n)[-n:]
         top_idx    = top_idx[np.argsort(scores[top_idx])[::-1]]
-        top_scores = scores[top_idx]
-
-        return top_idx, top_scores
+        return top_idx, scores[top_idx]
 
     def _check_fitted(self) -> None:
         if self.user_factors is None:
-            raise RuntimeError("ALS model is not fitted. Call fit() first.")
+            raise RuntimeError("ALS not fitted. Call fit() first.")
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
@@ -306,56 +254,43 @@ class ALS:
             n_factors    = np.array([self.n_factors]),
             reg          = np.array([self.reg]),
         )
-        log.info(f"ALS factors saved → {path}")
+        log.info(f"ALS saved → {path}")
 
     @classmethod
     def load(cls, path: Path = ALS_PATH) -> "ALS":
-        data = np.load(path)
+        data  = np.load(path)
         model = cls(
             n_factors = int(data["n_factors"][0]),
             reg       = float(data["reg"][0]),
         )
-        model.user_factors        = data["user_factors"]
-        model.item_factors        = data["item_factors"]
-        model.user_biases         = data["user_biases"]
-        model.item_biases         = data["item_biases"]
-        model.global_mean         = float(data["global_mean"][0])
-        model.train_rmse_history  = data["train_rmse"].tolist()
-        log.info(f"ALS factors loaded ← {path}")
+        model.user_factors       = data["user_factors"]
+        model.item_factors       = data["item_factors"]
+        model.user_biases        = data["user_biases"]
+        model.item_biases        = data["item_biases"]
+        model.global_mean        = float(data["global_mean"][0])
+        model.train_rmse_history = data["train_rmse"].tolist()
+        log.info(f"ALS loaded ← {path}")
         return model
 
-    # ── Expose factors as tensors for hybrid model ────────────────────────────
-
     def get_user_factors_tensor(self) -> torch.Tensor:
-        """Return user factors as a float32 tensor for use in hybrid model."""
         self._check_fitted()
         return torch.tensor(self.user_factors, dtype=torch.float32)
 
     def get_item_factors_tensor(self) -> torch.Tensor:
-        """Return item factors as a float32 tensor for use in hybrid model."""
         self._check_fitted()
         return torch.tensor(self.item_factors, dtype=torch.float32)
 
     def __repr__(self) -> str:
-        fitted = self.user_factors is not None
-        return (
-            f"ALS(n_factors={self.n_factors}, reg={self.reg}, "
-            f"n_iterations={self.n_iterations}, fitted={fitted})"
-        )
+        return (f"ALS(n_factors={self.n_factors}, reg={self.reg}, "
+                f"fitted={self.user_factors is not None})")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     from scipy import sparse as sp
-
     log.info("Loading CSR matrix...")
-    csr = sp.load_npz(CSR_MATRIX_PATH)
-
+    csr   = sp.load_npz(CSR_MATRIX_PATH)
     model = ALS()
     model.fit(csr)
     model.save()
-
-    log.info("\nTraining RMSE history:")
-    for i, rmse in enumerate(model.train_rmse_history, 1):
-        log.info(f"  Iter {i:>3}: {rmse:.5f}")
