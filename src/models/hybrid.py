@@ -1,40 +1,34 @@
 """
-DataFlix — Model 3: Hybrid CF + Content Model
+DataFlix — Model 3: Hybrid CF + Content
 src/models/hybrid.py
 
-Combines four information streams into a unified scoring model:
+Architecture:
+  User side: [ALS+BPR factors (2k)] + [history embedding (384)] → attention → d-dim
+  Item side: [ALS+BPR factors (2k)] + [SBERT (384)] + [IMDB (23)] + [pop (1)] → attention → d-dim
+  Score: MLP( [user_repr, item_repr, dot_product] ) → scalar
 
-  Stream 1 — ALS latent factors        (collaborative, k-dim)
-  Stream 2 — BPR embeddings            (ranking-optimised CF, k-dim)
-  Stream 3 — SBERT synopsis embeddings (semantic content, 384-dim)
-  Stream 4 — IMDB structured features  (genre OHE + runtime + votes, 23-dim)
+Training loss: BPR pairwise ranking loss (same as BPR model)
+  L = -mean( log σ( s(u, pos) - s(u, neg) ) )
 
-Training objective — BPR pairwise ranking loss:
-    L = -mean( log σ( s(u,i) - s(u,j) ) )
+Positives: items rated >= 4.0 (cleaner signal than all rated items)
+Negatives: popularity-weighted sampling with rejection
 
-    where i is a positive item (user rated >= 4.0) and j is a negative
-    item sampled by popularity. This directly optimises ranking quality
-    (what NDCG and Recall measure) rather than rating prediction (MSE).
-
-    The previous MSE objective caused the model to stop at epoch ~12 and
-    produce worse ranking metrics than BPR alone — content features were
-    learning to predict ratings, not to rank. Switching to BPR loss means
-    content features directly contribute to ranking signal.
-
-Two-phase training:
-    Phase 1 (freeze_epochs): CF embeddings frozen — only content
-    projections and attention head train. Prevents random gradients
-    from corrupting well-trained CF factors early on.
-
-    Phase 2 (remaining): Everything unfreezes for end-to-end fine-tuning.
+Why BPR loss (not MSE):
+  The model is evaluated on NDCG/Recall (ranking metrics).
+  MSE trains the model to predict ratings accurately.
+  These are different objectives. MSE causes early stopping at ~epoch 12
+  because content features plateau on rating prediction.
+  BPR loss directly optimises what we measure.
 """
 
 import logging
 import pickle
-from pathlib import Path
+import time
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -44,158 +38,121 @@ try:
     from src.config import (
         PROCESSED_DIR, RESULTS_DIR, DEVICE,
         TRAIN_CSV, VAL_CSV,
-        USER_POSITIVES_PATH, BPR_DATA_PATH,
+        BPR_DATA_PATH, USER_POSITIVES_PATH,
         SBERT_EMBEDDINGS_PATH, IMDB_FEATURES_PATH,
         POPULARITY_PATH, HISTORY_EMBEDDINGS_PATH,
-        LATENT_DIM_K, EMBED_DIM_D, NUM_HEADS,
-        MLP_HIDDEN, DROPOUT, SBERT_DIM, IMDB_FEAT_DIM,
-        LR_PATH_B, WEIGHT_DECAY, COSINE_T_MAX,
-        EARLY_STOP_PATIENCE, MAX_EPOCHS, BATCH_SIZE,
-        BPR_SAMPLES_PER_EPOCH,
+        LATENT_DIM_K, EMBED_DIM_D, NUM_HEADS, MLP_HIDDEN, DROPOUT,
+        SBERT_DIM, IMDB_FEAT_DIM,
+        LR_HYBRID, HYBRID_WEIGHT_DECAY, COSINE_T_MAX,
+        HYBRID_EPOCHS, HYBRID_BATCH_SIZE, HYBRID_SAMPLES_PER_EPOCH,
+        EARLY_STOP_PATIENCE, FREEZE_EPOCHS,
+        HYBRID_CKPT_PATH, RELEVANCE_RATING,
     )
 except ModuleNotFoundError:
     _ROOT = Path(__file__).resolve().parent.parent.parent
-    PROCESSED_DIR           = _ROOT / "data/processed"
-    RESULTS_DIR             = _ROOT / "results"
-    DEVICE                  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    TRAIN_CSV               = PROCESSED_DIR / "train.csv"
-    VAL_CSV                 = PROCESSED_DIR / "val.csv"
-    USER_POSITIVES_PATH     = PROCESSED_DIR / "user_positives.pkl"
-    BPR_DATA_PATH           = PROCESSED_DIR / "bpr_data.npz"
-    SBERT_EMBEDDINGS_PATH   = PROCESSED_DIR / "sbert_embeddings.pt"
-    IMDB_FEATURES_PATH      = PROCESSED_DIR / "imdb_features.pt"
-    POPULARITY_PATH         = PROCESSED_DIR / "popularity.pt"
-    HISTORY_EMBEDDINGS_PATH = PROCESSED_DIR / "history_embeddings.pt"
-    LATENT_DIM_K            = 100
-    EMBED_DIM_D             = 128
-    NUM_HEADS               = 4
-    MLP_HIDDEN              = [256, 64]
-    DROPOUT                 = 0.2
-    SBERT_DIM               = 384
-    IMDB_FEAT_DIM           = 23
-    LR_PATH_B               = 1e-3
-    WEIGHT_DECAY            = 1e-4
-    COSINE_T_MAX            = 50
-    EARLY_STOP_PATIENCE     = 7
-    MAX_EPOCHS              = 50
-    BATCH_SIZE              = 4096
-    BPR_SAMPLES_PER_EPOCH   = 200_000
+    PROCESSED_DIR              = _ROOT / "data/processed"
+    RESULTS_DIR                = _ROOT / "results"
+    DEVICE                     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    TRAIN_CSV                  = PROCESSED_DIR / "train.csv"
+    VAL_CSV                    = PROCESSED_DIR / "val.csv"
+    BPR_DATA_PATH              = PROCESSED_DIR / "bpr_data.npz"
+    USER_POSITIVES_PATH        = PROCESSED_DIR / "user_positives.pkl"
+    SBERT_EMBEDDINGS_PATH      = PROCESSED_DIR / "sbert_embeddings.pt"
+    IMDB_FEATURES_PATH         = PROCESSED_DIR / "imdb_features.pt"
+    POPULARITY_PATH            = PROCESSED_DIR / "popularity.pt"
+    HISTORY_EMBEDDINGS_PATH    = PROCESSED_DIR / "history_embeddings.pt"
+    LATENT_DIM_K               = 128
+    EMBED_DIM_D                = 256
+    NUM_HEADS                  = 4
+    MLP_HIDDEN                 = [512, 128]
+    DROPOUT                    = 0.2
+    SBERT_DIM                  = 384
+    IMDB_FEAT_DIM              = 23
+    LR_HYBRID                  = 1e-3
+    HYBRID_WEIGHT_DECAY        = 1e-4
+    COSINE_T_MAX               = 30
+    HYBRID_EPOCHS              = 50
+    HYBRID_BATCH_SIZE          = 4096
+    HYBRID_SAMPLES_PER_EPOCH   = 200_000
+    EARLY_STOP_PATIENCE        = 7
+    FREEZE_EPOCHS              = 5
+    HYBRID_CKPT_PATH           = RESULTS_DIR / "hybrid_best.pt"
+    RELEVANCE_RATING           = 4.0
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
-HYBRID_CKPT_PATH = RESULTS_DIR / "hybrid_best.pt"
 
+# ── Triplet Dataset ───────────────────────────────────────────────────────────
 
-# ── BPR Training Dataset ──────────────────────────────────────────────────────
-
-class BPRTripletDataset(Dataset):
+class TripletDataset(Dataset):
     """
-    Samples (user, positive_item, negative_item) triples for BPR training.
-
-    Positive items: movies the user rated >= 4.0 (genuinely liked).
-    Negative items: movies not in user's positive set, sampled by popularity.
-
-    Using rating >= 4.0 as positives (not all rated items) gives cleaner
-    training signal — we want the model to rank things the user liked above
-    things they haven't seen, not things they rated 2 stars.
+    (user, pos_item, neg_item) triples for BPR loss.
+    pos_item: item rated >= RELEVANCE_RATING
+    neg_item: popularity-weighted sample not in user's positive set
     """
-
     def __init__(
         self,
-        user_positives: dict[int, set],
-        all_items:      np.ndarray,
-        item_pop:       np.ndarray,
-        n_samples:      int,
-        n_users:        int,
+        pos_sets:   dict[int, set],
+        all_items:  np.ndarray,
+        item_pop:   np.ndarray,
+        n_samples:  int,
+        eligible:   np.ndarray,
     ):
-        self.user_positives = user_positives
-        self.all_items      = all_items
-        self.n_samples      = n_samples
-
-        # Popularity-weighted negative sampling probabilities
-        pop = item_pop.astype(np.float64)
-        self.item_probs = pop / pop.sum()
-
-        # Only sample from users who have at least one positive
-        self.eligible = np.array(
-            [u for u in range(n_users) if u in user_positives
-             and len(user_positives[u]) > 0],
-            dtype=np.int32,
-        )
+        pop             = item_pop.astype(np.float64)
+        self.probs      = pop / pop.sum()
+        self.pos_sets   = pos_sets
+        self.all_items  = all_items
+        self.eligible   = eligible
 
         # Pre-sample all triples for this epoch
-        self._sample()
+        self.users     = torch.empty(n_samples, dtype=torch.long)
+        self.pos_items = torch.empty(n_samples, dtype=torch.long)
+        self.neg_items = torch.empty(n_samples, dtype=torch.long)
+        self._resample(n_samples)
 
-    def _sample(self) -> None:
-        """Sample n_samples triples. Called once per epoch in fit()."""
-        users     = np.random.choice(self.eligible, size=self.n_samples)
-        pos_items = np.empty(self.n_samples, dtype=np.int32)
-        neg_items = np.empty(self.n_samples, dtype=np.int32)
-
-        for i, u in enumerate(users):
-            pos_set = self.user_positives[int(u)]
-            pos_items[i] = int(np.random.choice(list(pos_set)))
-
-            # Popularity-weighted negative with rejection sampling (max 20 tries)
+    def _resample(self, n: int) -> None:
+        users = np.random.choice(self.eligible, size=n)
+        for k, u in enumerate(users):
+            pos_set = self.pos_sets[int(u)]
+            self.users[k]     = int(u)
+            self.pos_items[k] = int(np.random.choice(list(pos_set)))
             for _ in range(20):
-                neg = int(np.random.choice(self.all_items, p=self.item_probs))
+                neg = int(np.random.choice(self.all_items, p=self.probs))
                 if neg not in pos_set:
                     break
-            neg_items[i] = neg
+            self.neg_items[k] = neg
 
-        self.users     = torch.tensor(users,     dtype=torch.long)
-        self.pos_items = torch.tensor(pos_items, dtype=torch.long)
-        self.neg_items = torch.tensor(neg_items, dtype=torch.long)
-
-    def __len__(self) -> int:
-        return self.n_samples
-
-    def __getitem__(self, idx):
-        return self.users[idx], self.pos_items[idx], self.neg_items[idx]
+    def __len__(self): return len(self.users)
+    def __getitem__(self, i): return self.users[i], self.pos_items[i], self.neg_items[i]
 
 
 # ── Sub-modules ───────────────────────────────────────────────────────────────
 
-def _make_mlp(in_dim, hidden, out_dim, dropout) -> nn.Sequential:
-    layers = []
-    prev = in_dim
+def _mlp(in_dim, hidden, out_dim, dropout) -> nn.Sequential:
+    layers, prev = [], in_dim
     for h in hidden:
-        layers += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.GELU(), nn.Dropout(dropout)]
+        layers += [nn.Linear(prev, h), nn.LayerNorm(h), nn.GELU(), nn.Dropout(dropout)]
         prev = h
     layers.append(nn.Linear(prev, out_dim))
     return nn.Sequential(*layers)
 
 
-class FeatureFusion(nn.Module):
-    """
-    Multi-head self-attention over a sequence of d-dim feature vectors.
-    Lets the model learn which streams matter most for each user-item pair.
-
-    Input:  (B, n_streams, d)
-    Output: (B, d)
-    """
+class Fusion(nn.Module):
+    """Self-attention over n_streams d-dim vectors → mean-pooled d-dim output."""
     def __init__(self, d: int, n_heads: int, dropout: float):
         super().__init__()
         self.attn = nn.MultiheadAttention(d, n_heads, dropout=dropout, batch_first=True)
         self.norm = nn.LayerNorm(d)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        attn_out, _ = self.attn(x, x, x)
-        return self.norm(x + attn_out).mean(dim=1)
+        # x: (B, n_streams, d)
+        out, _ = self.attn(x, x, x)
+        return self.norm(x + out).mean(dim=1)  # (B, d)
 
 
-# ── Main Model ────────────────────────────────────────────────────────────────
+# ── Model ─────────────────────────────────────────────────────────────────────
 
 class HybridModel(nn.Module):
-    """
-    Hybrid CF + Content scoring model.
-
-    Produces a single scalar score s(u,i) for any (user, item) pair.
-    Higher score = model predicts user prefers this item.
-
-    Trained with BPR loss: s(u, pos) should be > s(u, neg).
-    """
 
     def __init__(
         self,
@@ -207,93 +164,94 @@ class HybridModel(nn.Module):
         mlp_hidden:    list  = MLP_HIDDEN,
         dropout:       float = DROPOUT,
         sbert_dim:     int   = SBERT_DIM,
-        imdb_feat_dim: int   = IMDB_FEAT_DIM,
+        imdb_dim:      int   = IMDB_FEAT_DIM,
     ):
         super().__init__()
         self.embed_dim = embed_dim
+        cf_dim         = n_factors * 2  # ALS + BPR concatenated
 
-        # CF embeddings: ALS (k) + BPR (k) concatenated → (2k)
-        self.user_cf = nn.Embedding(n_users, n_factors * 2)
-        self.item_cf = nn.Embedding(n_items, n_factors * 2)
+        # CF embeddings
+        self.user_cf = nn.Embedding(n_users, cf_dim)
+        self.item_cf = nn.Embedding(n_items, cf_dim)
 
-        # Content projections → embed_dim
-        self.sbert_proj   = nn.Linear(sbert_dim,     embed_dim)
-        self.imdb_proj    = nn.Linear(imdb_feat_dim,  embed_dim)
-        self.history_proj = nn.Linear(sbert_dim,     embed_dim)
-        self.user_cf_proj = nn.Linear(n_factors * 2, embed_dim)
-        self.item_cf_proj = nn.Linear(n_factors * 2, embed_dim)
-        self.pop_proj     = nn.Linear(1,             embed_dim)
+        # Projections → embed_dim
+        self.proj_user_cf   = nn.Linear(cf_dim,    embed_dim)
+        self.proj_history   = nn.Linear(sbert_dim, embed_dim)
+        self.proj_item_cf   = nn.Linear(cf_dim,    embed_dim)
+        self.proj_sbert     = nn.Linear(sbert_dim, embed_dim)
+        self.proj_imdb      = nn.Linear(imdb_dim,  embed_dim)
+        self.proj_pop       = nn.Linear(1,         embed_dim)
 
-        # LayerNorms
-        self.ln_sbert   = nn.LayerNorm(embed_dim)
-        self.ln_imdb    = nn.LayerNorm(embed_dim)
-        self.ln_history = nn.LayerNorm(embed_dim)
-        self.ln_user_cf = nn.LayerNorm(embed_dim)
-        self.ln_item_cf = nn.LayerNorm(embed_dim)
+        # Layer norms
+        self.ln_user_cf  = nn.LayerNorm(embed_dim)
+        self.ln_history  = nn.LayerNorm(embed_dim)
+        self.ln_item_cf  = nn.LayerNorm(embed_dim)
+        self.ln_sbert    = nn.LayerNorm(embed_dim)
+        self.ln_imdb     = nn.LayerNorm(embed_dim)
 
         # Attention fusion
-        self.user_fusion = FeatureFusion(embed_dim, n_heads, dropout)  # 2 user streams
-        self.item_fusion = FeatureFusion(embed_dim, n_heads, dropout)  # 4 item streams
+        self.user_fusion = Fusion(embed_dim, n_heads, dropout)  # 2 streams
+        self.item_fusion = Fusion(embed_dim, n_heads, dropout)  # 4 streams
 
-        # Final scoring MLP: [user_repr, item_repr, dot] → scalar
-        self.score_mlp = _make_mlp(embed_dim * 2 + 1, mlp_hidden, 1, dropout)
+        # Scoring MLP: [u_repr, i_repr, dot] → scalar
+        self.score_mlp = _mlp(embed_dim * 2 + 1, mlp_hidden, 1, dropout)
 
-        self._init_weights()
+        self._init()
 
-    def _init_weights(self) -> None:
-        scale = 1.0 / np.sqrt(self.embed_dim)
-        nn.init.normal_(self.user_cf.weight, 0, scale)
-        nn.init.normal_(self.item_cf.weight, 0, scale)
-        for m in [self.sbert_proj, self.imdb_proj, self.history_proj,
-                  self.user_cf_proj, self.item_cf_proj, self.pop_proj]:
+    def _init(self):
+        s = 1.0 / np.sqrt(self.embed_dim)
+        nn.init.normal_(self.user_cf.weight, 0, s)
+        nn.init.normal_(self.item_cf.weight, 0, s)
+        for m in [self.proj_user_cf, self.proj_history, self.proj_item_cf,
+                  self.proj_sbert, self.proj_imdb, self.proj_pop]:
             nn.init.xavier_uniform_(m.weight)
             nn.init.zeros_(m.bias)
 
-    def load_cf_weights(
-        self,
-        user_factors: torch.Tensor,
-        item_factors: torch.Tensor,
-        user_bpr:     torch.Tensor,
-        item_bpr:     torch.Tensor,
-    ) -> None:
+    def load_cf_weights(self, uf, if_, ubpr, ibpr):
         with torch.no_grad():
-            self.user_cf.weight.copy_(torch.cat([user_factors, user_bpr], dim=1))
-            self.item_cf.weight.copy_(torch.cat([item_factors, item_bpr], dim=1))
-        log.info("Hybrid CF weights initialised from ALS + BPR")
+            self.user_cf.weight.copy_(torch.cat([uf,   ubpr], dim=1))
+            self.item_cf.weight.copy_(torch.cat([if_,  ibpr], dim=1))
+        log.info("Hybrid CF weights loaded from ALS + BPR")
 
-    def freeze_cf(self) -> None:
+    def freeze_cf(self):
         self.user_cf.weight.requires_grad_(False)
         self.item_cf.weight.requires_grad_(False)
-        log.info("CF embeddings frozen")
+        log.info("CF frozen")
 
-    def unfreeze_cf(self) -> None:
+    def unfreeze_cf(self):
         self.user_cf.weight.requires_grad_(True)
         self.item_cf.weight.requires_grad_(True)
-        log.info("CF embeddings unfrozen")
+        log.info("CF unfrozen")
 
-    def _encode_user(
+    def encode_user(
         self,
-        user_idx:    torch.Tensor,   # (B,)
-        history_emb: torch.Tensor,   # (B, 384)
-    ) -> torch.Tensor:               # (B, d)
-        p_u  = self.user_cf(user_idx)
-        u_cf = self.ln_user_cf(self.user_cf_proj(p_u))
-        u_hi = self.ln_history(self.history_proj(history_emb))
-        return self.user_fusion(torch.stack([u_cf, u_hi], dim=1))
+        user_idx:    torch.Tensor,  # (B,)
+        history_emb: torch.Tensor,  # (B, sbert_dim)
+    ) -> torch.Tensor:              # (B, embed_dim)
+        u_cf   = self.ln_user_cf(self.proj_user_cf(self.user_cf(user_idx)))
+        u_hist = self.ln_history(self.proj_history(history_emb))
+        return self.user_fusion(torch.stack([u_cf, u_hist], dim=1))
 
-    def _encode_item(
+    def encode_item(
         self,
-        item_idx:  torch.Tensor,   # (B,)
-        sbert_emb: torch.Tensor,   # (B, 384)
-        imdb_feat: torch.Tensor,   # (B, 23)
-        pop:       torch.Tensor,   # (B, 1)
-    ) -> torch.Tensor:             # (B, d)
-        q_i    = self.item_cf(item_idx)
-        i_cf   = self.ln_item_cf(self.item_cf_proj(q_i))
-        i_sb   = self.ln_sbert(self.sbert_proj(sbert_emb))
-        i_im   = self.ln_imdb(self.imdb_proj(imdb_feat))
-        i_pop  = self.pop_proj(pop)
+        item_idx:  torch.Tensor,  # (B,)
+        sbert_emb: torch.Tensor,  # (B, sbert_dim)
+        imdb_feat: torch.Tensor,  # (B, imdb_dim)
+        pop:       torch.Tensor,  # (B, 1)
+    ) -> torch.Tensor:            # (B, embed_dim)
+        i_cf   = self.ln_item_cf(self.proj_item_cf(self.item_cf(item_idx)))
+        i_sb   = self.ln_sbert(self.proj_sbert(sbert_emb))
+        i_im   = self.ln_imdb(self.proj_imdb(imdb_feat))
+        i_pop  = self.proj_pop(pop)
         return self.item_fusion(torch.stack([i_cf, i_sb, i_im, i_pop], dim=1))
+
+    def score(
+        self,
+        user_repr: torch.Tensor,  # (B, d)
+        item_repr: torch.Tensor,  # (B, d)
+    ) -> torch.Tensor:            # (B,)
+        dot = (user_repr * item_repr).sum(dim=1, keepdim=True)
+        return self.score_mlp(torch.cat([user_repr, item_repr, dot], dim=1)).squeeze(1)
 
     def forward(
         self,
@@ -304,14 +262,11 @@ class HybridModel(nn.Module):
         history_emb: torch.Tensor,
         pop:         torch.Tensor,
     ) -> torch.Tensor:
-        """Returns scalar score for each (user, item) pair. Shape: (B,)"""
-        u_repr = self._encode_user(user_idx, history_emb)
-        i_repr = self._encode_item(item_idx, sbert_emb, imdb_feat, pop)
-        dot    = (u_repr * i_repr).sum(dim=1, keepdim=True)
-        x      = torch.cat([u_repr, i_repr, dot], dim=1)
-        return self.score_mlp(x).squeeze(1)
+        u = self.encode_user(user_idx, history_emb)
+        i = self.encode_item(item_idx, sbert_emb, imdb_feat, pop)
+        return self.score(u, i)
 
-    def __repr__(self) -> str:
+    def __repr__(self):
         n = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return (f"HybridModel(n_users={self.user_cf.num_embeddings}, "
                 f"n_items={self.item_cf.num_embeddings}, "
@@ -321,40 +276,24 @@ class HybridModel(nn.Module):
 # ── Trainer ───────────────────────────────────────────────────────────────────
 
 class HybridTrainer:
-    """
-    Trains HybridModel with BPR pairwise ranking loss.
-
-    The training loop:
-      1. Sample (user, pos_item, neg_item) triples each epoch
-      2. Score both pos and neg items using HybridModel.forward()
-      3. Compute BPR loss: -mean( log σ( score(pos) - score(neg) ) )
-      4. Validate on a held-out set of (user, pos_item, neg_item) triples
-
-    Why BPR loss instead of MSE:
-      MSE trains the model to predict the exact rating value.
-      BPR trains the model to rank positive items above negative items.
-      NDCG and Recall measure ranking quality, not rating prediction accuracy.
-      A model trained with MSE optimises the wrong objective for ranking tasks.
-    """
 
     def __init__(
         self,
         model:          HybridModel,
-        sbert_emb:      torch.Tensor,
-        imdb_feats:     torch.Tensor,
-        popularity:     torch.Tensor,
-        history_emb:    torch.Tensor,
-        user_positives: dict[int, set],
+        sbert_emb:      torch.Tensor,   # (n_items, 384) — CPU
+        imdb_feats:     torch.Tensor,   # (n_items, 23)  — CPU
+        popularity:     torch.Tensor,   # (n_items,)     — CPU
+        history_emb:    torch.Tensor,   # (n_users, 384) — CPU
         all_items:      np.ndarray,
         item_pop:       np.ndarray,
         device:         torch.device = DEVICE,
-        lr:             float        = LR_PATH_B,
-        weight_decay:   float        = WEIGHT_DECAY,
-        n_epochs:       int          = MAX_EPOCHS,
-        batch_size:     int          = BATCH_SIZE,
-        samples_per_epoch: int       = BPR_SAMPLES_PER_EPOCH,
+        lr:             float        = LR_HYBRID,
+        weight_decay:   float        = HYBRID_WEIGHT_DECAY,
+        n_epochs:       int          = HYBRID_EPOCHS,
+        batch_size:     int          = HYBRID_BATCH_SIZE,
+        samples_per_epoch: int       = HYBRID_SAMPLES_PER_EPOCH,
         patience:       int          = EARLY_STOP_PATIENCE,
-        freeze_epochs:  int          = 5,
+        freeze_epochs:  int          = FREEZE_EPOCHS,
     ):
         self.model             = model.to(device)
         self.device            = device
@@ -363,123 +302,96 @@ class HybridTrainer:
         self.samples_per_epoch = samples_per_epoch
         self.patience          = patience
         self.freeze_epochs     = freeze_epochs
+        self.all_items         = all_items
+        self.item_pop          = item_pop
 
-        # Feature tensors on CPU — moved per batch with non_blocking
+        # Keep feature tensors on CPU; move per batch with non_blocking
         self.sbert_emb   = sbert_emb
         self.imdb_feats  = imdb_feats
         self.popularity  = popularity
         self.history_emb = history_emb
 
-        # BPR data
-        self.user_positives = user_positives
-        self.all_items      = all_items
-        self.item_pop       = item_pop
-        self.n_users        = model.user_cf.num_embeddings
-        self.n_items        = model.item_cf.num_embeddings
-
-        self.optimizer = optim.AdamW(
-            model.parameters(), lr=lr, weight_decay=weight_decay
-        )
+        self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=COSINE_T_MAX, eta_min=1e-5
         )
-
         self.best_val_loss           = float("inf")
         self.patience_counter        = 0
         self.train_loss_history: list[float] = []
         self.val_loss_history:   list[float] = []
 
-    def _get_item_features(
-        self, item_idx: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        cpu_idx = item_idx.cpu()
-        sbert = self.sbert_emb[cpu_idx].to(self.device, non_blocking=True)
-        imdb  = self.imdb_feats[cpu_idx].to(self.device, non_blocking=True)
-        pop   = self.popularity[cpu_idx].unsqueeze(1).to(self.device, non_blocking=True)
-        return sbert, imdb, pop
+    def _item_feats(self, item_idx: torch.Tensor):
+        """Fetch item feature tensors for a batch. Returns (sbert, imdb, pop)."""
+        cpu = item_idx.cpu()
+        s   = self.sbert_emb[cpu].to(self.device, non_blocking=True)
+        im  = self.imdb_feats[cpu].to(self.device, non_blocking=True)
+        p   = self.popularity[cpu].unsqueeze(1).to(self.device, non_blocking=True)
+        return s, im, p
 
-    def _get_user_features(
-        self, user_idx: torch.Tensor
-    ) -> torch.Tensor:
+    def _user_feats(self, user_idx: torch.Tensor) -> torch.Tensor:
+        """Fetch user history embedding for a batch. Returns (B, 384)."""
+        # user_idx is on GPU; index CPU tensor then move to GPU
         return self.history_emb[user_idx.cpu()].to(self.device, non_blocking=True)
 
-    def _bpr_loss(
-        self,
-        user_idx: torch.Tensor,
-        pos_idx:  torch.Tensor,
-        neg_idx:  torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        BPR loss = -mean( log σ( s(u,pos) - s(u,neg) ) )
+    def _bpr_step(self, u, pos, neg) -> torch.Tensor:
+        hist     = self._user_feats(u)
+        u_repr   = self.model.encode_user(u, hist)
 
-        Numerically equivalent to binary cross-entropy with all labels=1:
-        the model should score pos higher than neg for every user.
-        """
-        hist = self._get_user_features(user_idx)
+        s_pos, si_pos, p_pos = self._item_feats(pos)
+        s_neg, si_neg, p_neg = self._item_feats(neg)
 
-        s_pos_feat = self._get_item_features(pos_idx)
-        s_neg_feat = self._get_item_features(neg_idx)
+        i_pos_repr = self.model.encode_item(pos, s_pos, si_pos, p_pos)
+        i_neg_repr = self.model.encode_item(neg, s_neg, si_neg, p_neg)
 
-        s_pos = self.model(user_idx, pos_idx, *s_pos_feat, hist)
-        s_neg = self.model(user_idx, neg_idx, *s_neg_feat, hist)
+        score_pos = self.model.score(u_repr, i_pos_repr)
+        score_neg = self.model.score(u_repr, i_neg_repr)
 
-        return -torch.nn.functional.logsigmoid(s_pos - s_neg).mean()
+        return -torch.nn.functional.logsigmoid(score_pos - score_neg).mean()
 
-    def _run_epoch(
-        self,
-        loader: DataLoader,
-        train:  bool,
-    ) -> float:
+    def _run_epoch(self, loader, train: bool) -> float:
         self.model.train(train)
-        total_loss, total_n = 0.0, 0
-
+        total, n = 0.0, 0
         ctx = torch.enable_grad() if train else torch.no_grad()
         with ctx:
-            for user_idx, pos_idx, neg_idx in loader:
-                user_idx = user_idx.to(self.device)
-                pos_idx  = pos_idx.to(self.device)
-                neg_idx  = neg_idx.to(self.device)
-
-                loss = self._bpr_loss(user_idx, pos_idx, neg_idx)
-
+            for u, pos, neg in loader:
+                u   = u.to(self.device)
+                pos = pos.to(self.device)
+                neg = neg.to(self.device)
+                loss = self._bpr_step(u, pos, neg)
                 if train:
                     self.optimizer.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), max_norm=1.0
-                    )
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     self.optimizer.step()
-
-                total_loss += loss.item() * len(user_idx)
-                total_n    += len(user_idx)
-
-        return total_loss / total_n if total_n > 0 else float("inf")
+                total += loss.item() * len(u)
+                n     += len(u)
+        return total / n if n > 0 else float("inf")
 
     def fit(self) -> "HybridTrainer":
-        import time
-
-        # Build positive set for training: only items rated >= 4.0
-        # user_positives from BPR data uses all rated items — we need
-        # to filter to high-rated items for cleaner BPR training
-        log.info("  Building high-rated positive sets (rating >= 4.0)...")
-        import pandas as pd
+        # Build positive sets: only items rated >= RELEVANCE_RATING
+        log.info(f"  Building positive sets (rating >= {RELEVANCE_RATING})...")
         train_df = pd.read_csv(TRAIN_CSV)
-        high_rated = train_df[train_df["rating"] >= 4.0]
-        pos_high: dict[int, set] = defaultdict(set)
-        for row in high_rated.itertuples(index=False):
-            pos_high[int(row.user_idx)].add(int(row.movie_idx))
-
-        n_eligible = sum(1 for v in pos_high.values() if len(v) > 0)
-        log.info(f"  {n_eligible:,} users have >= 1 high-rated item")
-
-        # Build val positive set from val split
         val_df   = pd.read_csv(VAL_CSV)
-        val_high = val_df[val_df["rating"] >= 4.0]
-        val_pos: dict[int, set] = defaultdict(set)
-        for row in val_high.itertuples(index=False):
-            val_pos[int(row.user_idx)].add(int(row.movie_idx))
 
-        log.info(f"\nHybrid (BPR loss) training: {self.n_epochs} epochs | "
+        def _pos_sets(df):
+            ps = defaultdict(set)
+            for row in df[df["rating"] >= RELEVANCE_RATING].itertuples(index=False):
+                ps[int(row.user_idx)].add(int(row.movie_idx))
+            return dict(ps)
+
+        train_pos = _pos_sets(train_df)
+        val_pos   = _pos_sets(val_df)
+        n_users   = self.model.user_cf.num_embeddings
+
+        eligible_train = np.array(
+            [u for u, s in train_pos.items() if len(s) > 0], dtype=np.int32
+        )
+        eligible_val = np.array(
+            [u for u, s in val_pos.items() if len(s) > 0], dtype=np.int32
+        )
+        log.info(f"  {len(eligible_train):,} users have >= 1 high-rated train item")
+
+        log.info(f"\nHybrid training: {self.n_epochs} epochs | "
                  f"batch={self.batch_size} | device={self.device}")
         log.info(f"  Phase 1 (frozen CF) : epochs 1–{self.freeze_epochs}")
         log.info(f"  Phase 2 (full)      : epochs {self.freeze_epochs+1}–{self.n_epochs}")
@@ -488,58 +400,45 @@ class HybridTrainer:
 
         for epoch in range(1, self.n_epochs + 1):
             t = time.time()
-
             if epoch == self.freeze_epochs + 1:
                 self.model.unfreeze_cf()
 
-            # Re-sample triples every epoch — fresh negatives each time
-            train_dataset = BPRTripletDataset(
-                user_positives = pos_high,
-                all_items      = self.all_items,
-                item_pop       = self.item_pop,
-                n_samples      = self.samples_per_epoch,
-                n_users        = self.n_users,
+            # Fresh triplet sampling every epoch
+            train_ds = TripletDataset(
+                train_pos, self.all_items, self.item_pop,
+                self.samples_per_epoch, eligible_train,
             )
-            train_loader = DataLoader(
-                train_dataset, batch_size=self.batch_size,
-                shuffle=True, num_workers=0, pin_memory=True,
+            val_ds = TripletDataset(
+                val_pos, self.all_items, self.item_pop,
+                max(10_000, self.samples_per_epoch // 10), eligible_val,
             )
+            tr_loader = DataLoader(train_ds, batch_size=self.batch_size,
+                                   shuffle=True, num_workers=0, pin_memory=True)
+            va_loader = DataLoader(val_ds,   batch_size=self.batch_size * 2,
+                                   shuffle=False, num_workers=0)
 
-            # Val dataset — smaller, 10% of train samples
-            val_dataset = BPRTripletDataset(
-                user_positives = val_pos,
-                all_items      = self.all_items,
-                item_pop       = self.item_pop,
-                n_samples      = max(10000, self.samples_per_epoch // 10),
-                n_users        = self.n_users,
-            )
-            val_loader = DataLoader(
-                val_dataset, batch_size=self.batch_size * 2,
-                shuffle=False, num_workers=0,
-            )
-
-            train_loss = self._run_epoch(train_loader, train=True)
-            val_loss   = self._run_epoch(val_loader,   train=False)
+            tr_loss = self._run_epoch(tr_loader, train=True)
+            va_loss = self._run_epoch(va_loader, train=False)
             self.scheduler.step()
 
-            self.train_loss_history.append(train_loss)
-            self.val_loss_history.append(val_loss)
+            self.train_loss_history.append(tr_loss)
+            self.val_loss_history.append(va_loss)
 
             phase = "freeze" if epoch <= self.freeze_epochs else "full  "
             lr_now = self.scheduler.get_last_lr()[0]
             log.info(f"  [{phase}] Epoch {epoch:>3}/{self.n_epochs}  "
-                     f"train={train_loss:.5f}  val={val_loss:.5f}  "
+                     f"train={tr_loss:.5f}  val={va_loss:.5f}  "
                      f"lr={lr_now:.2e}  ({time.time()-t:.1f}s)")
 
-            if val_loss < self.best_val_loss:
-                self.best_val_loss    = val_loss
+            if va_loss < self.best_val_loss:
+                self.best_val_loss    = va_loss
                 self.patience_counter = 0
                 self.save(HYBRID_CKPT_PATH)
-                log.info(f"    ✓ Best val loss={val_loss:.5f} — checkpoint saved")
+                log.info(f"    ✓ Best val={va_loss:.5f} — saved")
             else:
                 self.patience_counter += 1
                 if self.patience_counter >= self.patience:
-                    log.info(f"  Early stopping at epoch {epoch}")
+                    log.info(f"  Early stop at epoch {epoch}")
                     break
 
         log.info(f"\nBest val loss: {self.best_val_loss:.5f}")
@@ -558,23 +457,15 @@ class HybridTrainer:
         }, path)
 
     @classmethod
-    def load_model(
-        cls,
-        path:   Path         = HYBRID_CKPT_PATH,
-        device: torch.device = DEVICE,
-        **model_kwargs,
-    ) -> HybridModel:
-        ckpt  = torch.load(path, map_location=device, weights_only=False)
-        model = HybridModel(
-            n_users   = ckpt["n_users"],
-            n_items   = ckpt["n_items"],
-            embed_dim = ckpt["embed_dim"],
-            **model_kwargs,
-        )
-        model.load_state_dict(ckpt["model_state"])
-        model.to(device).eval()
-        log.info(f"Hybrid loaded ← {path}  (best val loss={ckpt['best_val_loss']:.5f})")
-        return model
+    def load_model(cls, path=HYBRID_CKPT_PATH,
+                   device=DEVICE, **kw) -> HybridModel:
+        ck = torch.load(path, map_location=device, weights_only=False)
+        m  = HybridModel(n_users=ck["n_users"], n_items=ck["n_items"],
+                         embed_dim=ck["embed_dim"], **kw)
+        m.load_state_dict(ck["model_state"])
+        m.to(device).eval()
+        log.info(f"Hybrid loaded ← {path}  (best val={ck['best_val_loss']:.5f})")
+        return m
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
@@ -592,102 +483,34 @@ def score_all_items(
 ) -> np.ndarray:
     """
     Score all items for one user in batches.
+    Tensors can be on CPU or GPU — we handle both.
     Returns (n_items,) numpy array.
-    Excludes seen items is handled by caller (evaluate.py).
     """
     model.eval()
     n_items    = sbert_emb.shape[0]
     all_scores = np.empty(n_items, dtype=np.float32)
 
+    # User representation — computed once
     u_tensor = torch.tensor([user_idx], dtype=torch.long, device=device)
-    hist     = history_emb[user_idx].unsqueeze(0).to(device, non_blocking=True)
+    # history_emb may be on CPU or GPU
+    hist_row = history_emb[user_idx]  # (384,)
+    if hist_row.device != torch.device(device):
+        hist_row = hist_row.to(device, non_blocking=True)
+    hist = hist_row.unsqueeze(0)  # (1, 384)
+    u_repr = model.encode_user(u_tensor, hist)  # (1, d)
 
     for start in range(0, n_items, batch_size):
         end      = min(start + batch_size, n_items)
-        item_ids = torch.arange(start, end, dtype=torch.long, device=device)
         B        = end - start
+        item_ids = torch.arange(start, end, dtype=torch.long, device=device)
 
-        sbert = sbert_emb[start:end].to(device, non_blocking=True)
-        imdb  = imdb_feats[start:end].to(device, non_blocking=True)
-        pop   = popularity[start:end].unsqueeze(1).to(device, non_blocking=True)
-        hist_b = hist.expand(B, -1)
-        u_b    = u_tensor.expand(B)
+        s  = sbert_emb[start:end].to(device, non_blocking=True)
+        im = imdb_feats[start:end].to(device, non_blocking=True)
+        p  = popularity[start:end].unsqueeze(1).to(device, non_blocking=True)
 
-        all_scores[start:end] = model(u_b, item_ids, sbert, imdb, hist_b, pop).cpu().numpy()
+        i_repr = model.encode_item(item_ids, s, im, p)             # (B, d)
+        u_exp  = u_repr.expand(B, -1)                               # (B, d)
+        scores = model.score(u_exp, i_repr)                         # (B,)
+        all_scores[start:end] = scores.cpu().numpy()
 
     return all_scores
-
-
-@torch.no_grad()
-def recommend(
-    model:       HybridModel,
-    user_idx:    int,
-    sbert_emb:   torch.Tensor,
-    imdb_feats:  torch.Tensor,
-    popularity:  torch.Tensor,
-    history_emb: torch.Tensor,
-    n:           int = 10,
-    seen_items:  set | None = None,
-    device:      torch.device = DEVICE,
-) -> tuple[np.ndarray, np.ndarray]:
-    scores = score_all_items(
-        model, user_idx, sbert_emb, imdb_feats,
-        popularity, history_emb, device,
-    )
-    if seen_items:
-        scores = scores.copy()
-        scores[list(seen_items)] = -np.inf
-    top_idx    = np.argpartition(scores, -n)[-n:]
-    top_idx    = top_idx[np.argsort(scores[top_idx])[::-1]]
-    return top_idx, scores[top_idx]
-
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import pandas as pd
-    from src.models.als import ALS
-    from src.models.bpr import BPR, BPR_FACTORS_PATH
-
-    log.info("Loading feature tensors...")
-    sbert_emb   = torch.load(SBERT_EMBEDDINGS_PATH,   weights_only=False)
-    imdb_feats  = torch.load(IMDB_FEATURES_PATH,      weights_only=False)
-    popularity  = torch.load(POPULARITY_PATH,          weights_only=False)
-    history_emb = torch.load(HISTORY_EMBEDDINGS_PATH, weights_only=False)
-
-    log.info("Loading BPR data...")
-    bpr_data = np.load(BPR_DATA_PATH)
-    all_items = bpr_data["all_items"]
-    item_pop  = bpr_data["item_pop_values"]
-    with open(USER_POSITIVES_PATH, "rb") as f:
-        user_positives = pickle.load(f)
-
-    train_df = pd.read_csv(TRAIN_CSV)
-    n_users  = int(train_df["user_idx"].max()) + 1
-    n_items  = int(train_df["movie_idx"].max()) + 1
-
-    model = HybridModel(n_users=n_users, n_items=n_items)
-    log.info(repr(model))
-
-    als_path = RESULTS_DIR / "als_factors.npz"
-    if als_path.exists() and BPR_FACTORS_PATH.exists():
-        als = ALS.load(als_path)
-        bpr = BPR.load(BPR_FACTORS_PATH, device=torch.device("cpu"))
-        model.load_cf_weights(
-            user_factors = als.get_user_factors_tensor(),
-            item_factors = als.get_item_factors_tensor(),
-            user_bpr     = bpr.get_user_embeddings_tensor(),
-            item_bpr     = bpr.get_item_embeddings_tensor(),
-        )
-
-    trainer = HybridTrainer(
-        model          = model,
-        sbert_emb      = sbert_emb,
-        imdb_feats     = imdb_feats,
-        popularity     = popularity,
-        history_emb    = history_emb,
-        user_positives = user_positives,
-        all_items      = all_items,
-        item_pop       = item_pop,
-    )
-    trainer.fit()
