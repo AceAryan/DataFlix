@@ -1,46 +1,29 @@
 """
-DataFlix — Master Preprocessing Pipeline
+DataFlix — Preprocessing Pipeline
 scripts/run_preprocessing.py
 
-Data sources:
-  MovieLens 25M  — ratings, movies, links (training + evaluation)
-  IMDB           — title.basics.tsv + title.ratings.tsv (content features)
-  TMDB           — TMDB_movie_dataset_v11.csv (SBERT synopses)
-
-Netflix Prize was evaluated as a cross-domain validation source but dropped:
-  - Title/year alignment achieved only 5.9% movie coverage (1,045 / 17,770)
-  - 94.1% of Netflix ratings mapped to movies outside the shared item space
-  - Cross-domain evaluation was statistically unreliable
-  - Decision documented in parse.py and preprocess.py
-
 Usage:
-  python scripts/run_preprocessing.py                  # Full pipeline
-  python scripts/run_preprocessing.py --skip-sbert     # Skip SBERT re-encoding
-  python scripts/run_preprocessing.py --from-step 2    # Skip alignment
-  python scripts/run_preprocessing.py --from-step 3    # Re-run features only
+  python scripts/run_preprocessing.py                # full pipeline
+  python scripts/run_preprocessing.py --skip-sbert   # skip SBERT re-encoding
+  python scripts/run_preprocessing.py --from-step 2  # skip parsing
+  python scripts/run_preprocessing.py --from-step 3  # features only
 """
 
-import argparse
-import json
-import logging
-import sys
-import time
+import argparse, json, logging, sys, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import pandas as pd
-
 from src.config import (
     PROCESSED_DIR, STATS_JSON,
     TRAIN_CSV, VAL_CSV, TEST_CSV,
     MOVIE_MAP_CSV, USER_MAP_CSV,
-    CSR_MATRIX_PATH, SBERT_EMBEDDINGS_PATH,
-    IMDB_FEATURES_PATH,
+    CSR_MATRIX_PATH, SBERT_EMBEDDINGS_PATH, IMDB_FEATURES_PATH,
     set_seed,
 )
-from src.data.parse      import load_all_ratings
+from src.data.parse      import load_ratings
 from src.data.preprocess import run_preprocessing
 from src.data.features   import run_feature_engineering
 
@@ -52,70 +35,55 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def _step2_done() -> bool:
-    return all(p.exists() for p in [TRAIN_CSV, VAL_CSV, TEST_CSV,
-                                     MOVIE_MAP_CSV, USER_MAP_CSV,
-                                     CSR_MATRIX_PATH])
+def _elapsed(t): s = time.time()-t; return f"{int(s//60)}m {s%60:.1f}s"
 
-def _step3_done(skip_sbert: bool) -> bool:
-    required = [IMDB_FEATURES_PATH]
-    if not skip_sbert:
-        required.append(SBERT_EMBEDDINGS_PATH)
-    return all(p.exists() for p in required)
-
-def _banner(step: int, title: str) -> None:
+def _banner(title):
     log.info("")
     log.info("=" * 60)
-    log.info(f"  STEP {step}: {title}")
+    log.info(f"  {title}")
     log.info("=" * 60)
-
-def _elapsed(start: float) -> str:
-    s = time.time() - start
-    return f"{int(s//60)}m {s%60:.1f}s"
 
 
 def run_pipeline(from_step: int = 1, skip_sbert: bool = False) -> None:
-    t_total = time.time()
+    t0 = time.time()
     set_seed()
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     log.info("")
     log.info("╔══════════════════════════════════════════════════════╗")
-    log.info("║        DataFlix Preprocessing Pipeline               ║")
-    log.info("║        Source: MovieLens 25M + IMDB + TMDB           ║")
+    log.info("║   DataFlix Preprocessing  —  ML-32M + IMDB + TMDB   ║")
     log.info("╚══════════════════════════════════════════════════════╝")
 
-    # ── Step 1: Parse ─────────────────────────────────────────────────────────
+    # Step 1: Parse
+    ratings = None
     if from_step <= 1:
-        _banner(1, "Parse & Validate Ratings")
+        _banner("STEP 1 — Parse & Validate Ratings")
         t = time.time()
-        ratings = load_all_ratings()
-        log.info(f"  Step 1 complete ({_elapsed(t)}) — {len(ratings):,} ratings loaded")
+        ratings = load_ratings()
+        log.info(f"  Done ({_elapsed(t)})")
     else:
-        log.info("Skipping Step 1 (--from-step >= 2)")
-        ratings = None
+        log.info("Skipping Step 1")
 
-    # ── Step 2: Preprocess ────────────────────────────────────────────────────
+    # Step 2: Preprocess
+    stats = {}
     if from_step <= 2:
-        _banner(2, "Filter · Split · Map IDs · CSR · BPR")
+        _banner("STEP 2 — Filter · Split · Map IDs · CSR · BPR")
         t = time.time()
         if ratings is None:
-            log.info("  Re-parsing ratings for step 2...")
-            ratings = load_all_ratings()
+            ratings = load_ratings()
         stats = run_preprocessing(ratings)
-        log.info(f"  Step 2 complete ({_elapsed(t)})")
-        _print_stats(stats)
+        log.info(f"  Done ({_elapsed(t)})")
     else:
-        log.info("Skipping Step 2 (--from-step >= 3)")
-        if not _step2_done():
-            raise FileNotFoundError("Processed CSVs not found. Run from step 2.")
+        log.info("Skipping Step 2")
+        if not CSR_MATRIX_PATH.exists():
+            raise FileNotFoundError("CSR matrix not found. Run from step 2.")
         if STATS_JSON.exists():
             with open(STATS_JSON) as f:
                 stats = json.load(f)
 
-    # ── Step 3: Feature engineering ───────────────────────────────────────────
+    # Step 3: Features
     if from_step <= 3:
-        _banner(3, "IMDB Features · SBERT Embeddings · Popularity · History")
+        _banner("STEP 3 — IMDB Features · SBERT · Popularity · History")
         t = time.time()
         movie_map_df = pd.read_csv(MOVIE_MAP_CSV)
         user_map_df  = pd.read_csv(USER_MAP_CSV)
@@ -126,76 +94,50 @@ def run_pipeline(from_step: int = 1, skip_sbert: bool = False) -> None:
             movie_map=movie_map, user_map=user_map,
             train_df=train_df, skip_sbert=skip_sbert,
         )
-        log.info(f"  Step 3 complete ({_elapsed(t)})")
+        log.info(f"  Done ({_elapsed(t)})")
     else:
-        log.info("Skipping Step 3 (--from-step >= 4)")
+        log.info("Skipping Step 3")
 
-    # ── Done ──────────────────────────────────────────────────────────────────
     log.info("")
     log.info("╔══════════════════════════════════════════════════════╗")
     log.info("║  PREPROCESSING COMPLETE                               ║")
-    log.info(f"║  Total time: {_elapsed(t_total):<42}║")
+    log.info(f"║  Total: {_elapsed(t0):<47}║")
     log.info("╚══════════════════════════════════════════════════════╝")
-    log.info("")
-    _list_outputs()
+    if stats:
+        log.info(f"  Users={stats.get('n_users',0):,} | Movies={stats.get('n_movies',0):,} | "
+                 f"Train={stats.get('n_train',0):,} | Density={stats.get('density',0):.4f}%")
 
-
-def _print_stats(stats: dict) -> None:
-    log.info("")
-    log.info("  Dataset statistics:")
-    log.info(f"    Users          : {stats['n_users']:>10,}")
-    log.info(f"    Movies         : {stats['n_movies']:>10,}")
-    log.info(f"    Train ratings  : {stats['n_train']:>10,}")
-    log.info(f"    Val ratings    : {stats['n_val']:>10,}")
-    log.info(f"    Test ratings   : {stats['n_test']:>10,}")
-    log.info(f"    Cold-start     : {stats['n_cold_start']:>10,}")
-    log.info(f"    Matrix density : {stats['density_pct']:>9.4f}%")
-
-
-def _list_outputs() -> None:
-    from src.config import (
-        NF_TO_ML_MAP_JSON, BPR_DATA_PATH, USER_POSITIVES_PATH,
-        COLD_START_CSV, POPULARITY_PATH, HISTORY_EMBEDDINGS_PATH,
-        GENRE_TABLE_PATH, MOVIE_MAP_CSV, USER_MAP_CSV,
-    )
-    output_files = [
-        ("Train split",          TRAIN_CSV),
-        ("Val split",            VAL_CSV),
-        ("Test split",           TEST_CSV),
-        ("User map",             USER_MAP_CSV),
-        ("Movie map",            MOVIE_MAP_CSV),
-        ("CSR matrix",           CSR_MATRIX_PATH),
-        ("BPR data",             BPR_DATA_PATH),
-        ("User positives",       USER_POSITIVES_PATH),
-        ("Cold-start users",     COLD_START_CSV),
-        ("IMDB features",        IMDB_FEATURES_PATH),
-        ("SBERT embeddings",     SBERT_EMBEDDINGS_PATH),
-        ("Popularity",           POPULARITY_PATH),
-        ("History embeddings",   PROCESSED_DIR / "history_embeddings.pt"),
-        ("Genre table",          GENRE_TABLE_PATH),
-        ("Stats",                STATS_JSON),
+    # Output checklist
+    from src.config import (BPR_DATA_PATH, USER_POSITIVES_PATH, COLD_START_CSV,
+                             POPULARITY_PATH, HISTORY_EMBEDDINGS_PATH, GENRE_TABLE_PATH)
+    files = [
+        ("Train",        TRAIN_CSV),
+        ("Val",          VAL_CSV),
+        ("Test",         TEST_CSV),
+        ("User map",     USER_MAP_CSV),
+        ("Movie map",    MOVIE_MAP_CSV),
+        ("CSR matrix",   CSR_MATRIX_PATH),
+        ("BPR data",     BPR_DATA_PATH),
+        ("User pos",     USER_POSITIVES_PATH),
+        ("Cold users",   COLD_START_CSV),
+        ("IMDB feats",   IMDB_FEATURES_PATH),
+        ("SBERT embs",   SBERT_EMBEDDINGS_PATH),
+        ("Popularity",   POPULARITY_PATH),
+        ("History embs", HISTORY_EMBEDDINGS_PATH),
+        ("Genre table",  GENRE_TABLE_PATH),
+        ("Stats",        STATS_JSON),
     ]
-    for label, path in output_files:
-        status = "✓" if path.exists() else "✗ MISSING"
-        size   = f"  ({path.stat().st_size / 1e6:.1f} MB)" if path.exists() else ""
-        log.info(f"  [{status}] {label:<22} {path.name}{size}")
+    for label, path in files:
+        ok   = "✓" if path.exists() else "✗"
+        size = f"  ({path.stat().st_size/1e6:.1f}MB)" if path.exists() else ""
+        log.info(f"  [{ok}] {label:<16} {path.name}{size}")
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="DataFlix preprocessing pipeline (MovieLens 25M)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python scripts/run_preprocessing.py                Full pipeline
-  python scripts/run_preprocessing.py --skip-sbert   Skip SBERT re-encoding
-  python scripts/run_preprocessing.py --from-step 2  Skip parsing
-  python scripts/run_preprocessing.py --from-step 3  Re-run features only
-        """,
-    )
-    parser.add_argument("--from-step", type=int, default=1, choices=[1, 2, 3])
-    parser.add_argument("--skip-sbert", action="store_true")
-    return parser.parse_args()
+def _parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--from-step", type=int, default=1, choices=[1,2,3])
+    p.add_argument("--skip-sbert", action="store_true")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
