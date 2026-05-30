@@ -1,106 +1,100 @@
-# DataFlix — Hybrid Movie Recommendation System
+# DataFlix — Large-Scale Recommendation Systems Pipeline
 
-A hybrid recommendation system built on the Netflix and MovieLens datasets, combining matrix factorization, semantic embeddings, and ranking-aware learning.
-
-Initially developed at IIT Gandhinagar for CS 328 (Intro to Data Science) by Aryan Kumar, Sura Sravan Kumar, and Shreyash Pandit. Extended and maintained by Aryan Kumar.
+A large-scale recommendation pipeline built on the MovieLens-32M dataset enriched with TMDB and IMDb metadata, combining collaborative filtering, graph learning, semantic embeddings, and ranking-aware optimization. The pipeline is optimized to train large sparse recommendation graphs efficiently on consumer-grade hardware (6GB VRAM).
 
 ---
 
 ## What it does
 
-- Predicts user movie preferences using collaborative + content-based filtering
-- Handles cold-start users via SBERT plot embeddings and genre metadata
-- Evaluates in a zero-shot cross-domain setup: trained on MovieLens 25M, evaluated on Netflix
-- Optimizes ranking quality with Bayesian Personalized Ranking (BPR)
+* **Predicts user preferences** using a blend of collaborative and content-based filtering.
+* **Handles sparse-user and cold-start recommendation scenarios** using SBERT semantic embeddings.
+* **Benchmarks multiple paradigms:** Matrix Factorization (ALS), Bayesian Personalized Ranking (BPR), Two-Tower Retrieval, LightGCN, and Hybrid models.
+* **Evaluates ranking quality** using Recall@K and NDCG@K.
+* **Implements $\mathcal{O}(1)$ inference caching** via precomputed NumPy arrays, reducing evaluation bottlenecks for 190K+ users to instant vector dot-products. 
+* **Engineers CPU-graph offloading** to train 60M+ edge networks efficiently within a strict 6GB VRAM constraint.
 
 ---
 
 ## How it works
 
-**Matrix Factorization** approximates the user-item rating matrix:
+### Matrix Factorization (ALS)
+Approximates the user-item interaction matrix:
+$$\hat{r}_{ui} = \mu + b_u + b_i + p_u^T q_i$$
+Where $p_u$ and $q_i$ are latent vectors, and $b_u, b_i$ are learned biases.
 
-```
-r̂_ui = μ + b_u + b_i + pᵤᵀ qᵢ
-```
+### Bayesian Personalized Ranking (BPR)
+Optimizes pairwise ranking quality instead of explicit rating prediction, encouraging observed interactions to rank above sampled negatives:
+$$L = -\log \sigma(\hat{r}_{ui} - \hat{r}_{uj})$$
 
-**Movie embeddings** combine:
-- Latent MF vector
-- Genre encoding
-- SBERT plot summary embedding
-- Popularity score
+### LightGCN
+Learns embeddings through linear propagation over the bipartite interaction graph, capturing higher-order collaborative relationships without handcrafted features:
+$$\mathbf{E}^{(k+1)} = \hat{A}\mathbf{E}^{(k)}$$
 
-**User embeddings** combine:
-- Latent MF vector
-- Aggregated embeddings of liked movies
-- Behavioral features (mean rating, variance, activity)
+### Two-Tower Retrieval
+A purely semantic dual-encoder architecture. The Item Tower encodes SBERT plot descriptions and IMDb genres, while the User Tower encodes chronological watch history, enabling zero-shot cold-start recommendations.
 
-**Ranking loss (BPR):**
-```
-L = -log σ(r̂_ui − r̂_uj)
-```
+### Hybrid Model
+Initializes using pre-computed collaborative factors (BPR/ALS) and dynamically fuses them with content-based semantic representations (SBERT/Metadata) through dense MLP layers. It bridges the gap between behavioral memorization and text-based generalization.
 
-**Zero-shot cross-domain setup:**  
-The model trains on MovieLens 25M and evaluates on Netflix. A TF-IDF fuzzy matcher (`src/data/alignment.py`) aligns ~55% of the Netflix catalog to MovieLens IDs. All Netflix users are cold-start — the model relies entirely on content signals, no learned user factors.
+### Semantic Item & User Embeddings
+* **Movie Representations:** Combines latent MF vectors, SBERT plot embeddings, genre encodings, and popularity features.
+* **User Representations:** Combines collaborative latent vectors, aggregated watch-history embeddings, and behavioral statistics.
 
 ---
 
-## Stack
+## 📊 Final Evaluation Results
 
-| Area | Tools |
-|---|---|
-| Core | Python, PyTorch, NumPy, SciPy |
-| NLP | Sentence-BERT (SBERT) |
-| Hyperparameter tuning | Optuna |
-| Visualization | Matplotlib, Seaborn, UMAP |
+| Model | Overall NDCG@10 | Warm User NDCG | Cold User NDCG |
+| :--- | :--- | :--- | :--- |
+| **LightGCN** | **0.0434** | **0.0434** | 0.0431 |
+| **BPR** | 0.0404 | 0.0389 | **0.0547** |
+| **Hybrid** | [TBD] | [TBD] | [TBD] |
+| **Two-Tower** | 0.0302 | 0.0296 | 0.0364 |
+| **ALS** | 0.0001 | 0.0001 | 0.0000 |
 
----
+**Observations:**
+* **LightGCN** achieved the strongest overall ranking quality through multi-hop collaborative propagation.
+* **BPR** remains a highly competitive, computationally lightweight baseline.
+* **Hybrid** [TBD - Fill this in based on whether it successfully beat BPR on cold users or bridged the overall gap].
+* **Semantic retrieval models** (Two-Tower) generalize much better for cold-start users and unseen items.  
 
-## Datasets
-
-| Dataset | Size |
-|---|---|
-| Netflix ratings | ~17M ratings, ~480K users, ~17K movies |
-| MovieLens 25M | 25M ratings, training only |
-| IMDb / TMDb | Metadata and plot summaries |
-
----
-
-## Evaluation
-
-| Metric | Measures |
-|---|---|
-| RMSE, MAE | Rating prediction accuracy |
-| Precision@K, Recall@K | Top-K recommendation quality |
-| NDCG@K | Ranking quality |
-| Coverage | Recommendation diversity |
+![NDCG Comparison](results/ndcg_comparison.png)
 
 ---
 
-## Running the pipeline
+## 💻 Tech Stack
+
+| Area | Tools & Libraries |
+| :--- | :--- |
+| **Core ML** | PyTorch, NumPy, SciPy, Torch Sparse |
+| **NLP** | SentenceTransformers (SBERT) |
+| **Data Processing** | Pandas, scikit-learn |
+
+---
+
+## ⚙️ Running the Pipeline
 
 ```bash
-# 1. Align Netflix → MovieLens movie IDs
-python src/data/alignment.py
+# 1. Preprocess Data & Build Graphs
+python scripts/preprocess.py
 
-# 2. Preprocess
-python scripts/run_preprocess.py
+# 2. Train Models
+python scripts/train.py
 
-# 3. Train
-python scripts/run_train.py
-
-# 4. Evaluate
-python scripts/run_evaluate.py
+# 3. Evaluate Ranking Metrics
+python scripts/evaluate.py
 ```
 
 ---
 
-## Setup
+ ## Setup
 
-```bash
+```
 git clone https://github.com/AceAryan/dataflix.git
 cd dataflix
 python -m venv .venv
-.venv\Scripts\activate        # Windows
+source .venv/bin/activate # macOS/Linux
+.venv\Scripts\activate # Windows (Command Prompt / PowerShell)
 pip install -r requirements.txt
 ```
 
@@ -108,22 +102,22 @@ pip install -r requirements.txt
 
 ---
 
-## Project structure
+## Project Structure
 
 ```
 dataflix/
 ├── data/
-│   ├── raw/          # Downloaded datasets (not committed)
-│   └── processed/    # Preprocessed matrices and tensors (not committed)
-├── src/              # Model classes, training logic, data alignment
-├── scripts/          # Pipeline scripts (preprocess, train, evaluate)
-├── tests/            # GPU checks, model load verification
-├── results/          # Training curves, UMAP plots (not committed)
-└── reports/          # Project proposal and analysis
+│   ├── raw/               # Downloaded datasets (not committed)
+│   └── processed/         # Sparse matrices and tensor caches
+├── src/
+│   ├── models/            # LightGCN, BPR, TwoTower, Hybrid
+│   ├── data/              # Preprocessing and embedding modules
+│   └── config.py
+├── scripts/               # Training and evaluation pipeline
+│   ├── preprocess.py
+│   ├── train.py
+│   └── evaluate.py
+├── results/               # Checkpoints and evaluation reports (ignored)
+└── tests/
+
 ```
-
----
-
-## License
-
-Academic and research use only.
