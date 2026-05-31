@@ -1,16 +1,15 @@
 """
-DataFlix — Training Pipeline
+DataFlix — Central Training Pipeline
 scripts/train.py
 
 Usage:
-  python scripts/train.py                  # train all three
-  python scripts/train.py --model als
-  python scripts/train.py --model bpr
-  python scripts/train.py --model hybrid
-  python scripts/train.py --skip-als       # load existing ALS, train BPR+Hybrid
+  python scripts/train.py --models all
+  python scripts/train.py --models lightgcn sasrec twotower
+  python scripts/train.py --models hybrid
+  python scripts/train.py --models easr
 """
 
-import argparse, json, logging, pickle, sys, time
+import argparse, logging, pickle, sys, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -23,223 +22,170 @@ from scipy import sparse
 
 from src.config import (
     PROCESSED_DIR, RESULTS_DIR, DEVICE,
-    TRAIN_CSV, VAL_CSV,
-    CSR_MATRIX_PATH, BPR_DATA_PATH, USER_POSITIVES_PATH,
-    SBERT_EMBEDDINGS_PATH, IMDB_FEATURES_PATH,
-    POPULARITY_PATH, HISTORY_EMBEDDINGS_PATH,
+    TRAIN_CSV, VAL_CSV, CSR_MATRIX_PATH, BPR_DATA_PATH, USER_POSITIVES_PATH,
+    SBERT_EMBEDDINGS_PATH, IMDB_FEATURES_PATH, POPULARITY_PATH, HISTORY_EMBEDDINGS_PATH,
     ALS_PATH, BPR_FACTORS_PATH, HYBRID_CKPT_PATH,
-    LATENT_DIM_K, ALS_ITERATIONS, ALS_REG,
-    LR_BPR, BPR_REG, BPR_EPOCHS, BPR_BATCH_SIZE, BPR_SAMPLES_PER_EPOCH,
-    LR_HYBRID, HYBRID_WEIGHT_DECAY, HYBRID_EPOCHS,
-    HYBRID_BATCH_SIZE, HYBRID_SAMPLES_PER_EPOCH,
-    EARLY_STOP_PATIENCE, FREEZE_EPOCHS,
-    EMBED_DIM_D, NUM_HEADS,
+    LATENT_DIM_K, ALS_ITERATIONS, ALS_REG, LR_BPR, BPR_REG, BPR_EPOCHS, BPR_BATCH_SIZE, 
+    BPR_SAMPLES_PER_EPOCH, LR_HYBRID, HYBRID_WEIGHT_DECAY, HYBRID_EPOCHS,
+    HYBRID_BATCH_SIZE, HYBRID_SAMPLES_PER_EPOCH, EARLY_STOP_PATIENCE, FREEZE_EPOCHS, EMBED_DIM_D,
     set_seed,
 )
-from src.models.als    import ALS
-from src.models.bpr    import BPR
-from src.models.hybrid import HybridModel, HybridTrainer
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
-)
+from src.models.als      import ALS
+from src.models.bpr      import BPR
+from src.models.easr     import EASR                                    # ← EASE^R
+from src.models.hybrid   import HybridModel, HybridTrainer
+from src.models.twotower import TwoTowerModel, TwoTowerTrainer
+from src.models.lightgcn import LightGCN, LightGCNTrainer, LIGHTGCN_CKPT_PATH
+from src.models.sasrec   import SASRec, SASRecTrainer, SASREC_CKPT_PATH
+
+TWOTOWER_CKPT_PATH  = RESULTS_DIR / "twotower_best.pt"
+LIGHTGCN_GRAPH_PATH = PROCESSED_DIR / "lightgcn_graph.npz"
+SASREC_SEQS_PATH    = PROCESSED_DIR / "sasrec_seqs.pkl"
+EASR_PATH           = RESULTS_DIR / "easr.npz"                         # ← EASE^R checkpoint
+
+# ── EASE^R hyper-parameter ────────────────────────────────────────────────────
+# λ=350 is a strong default for ML-scale dense CF matrices.
+# Sweep [200, 350, 500, 750] if you want to tune — each run is cheap.
+EASR_REG = 350.0
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
-_csr_cache = None
-
-
 def _elapsed(t): s = time.time()-t; return f"{int(s//60)}m {s%60:.1f}s"
-
-def _banner(title):
-    log.info("")
-    log.info("=" * 60)
-    log.info(f"  {title}")
-    log.info("=" * 60)
-
-def _load_csr():
-    global _csr_cache
-    if _csr_cache is None:
-        log.info(f"Loading CSR matrix...")
-        _csr_cache = sparse.load_npz(CSR_MATRIX_PATH)
-    return _csr_cache
-
-def _get_dims():
-    csr = _load_csr()
-    return csr.shape  # (n_users, n_items)
-
-def _load_splits():
-    log.info("Loading train/val splits...")
-    tr = pd.read_csv(TRAIN_CSV)
-    va = pd.read_csv(VAL_CSV)
-    log.info(f"  Train={len(tr):,} | Val={len(va):,}")
-    return tr, va
+def _banner(title): log.info(f"\n{'='*60}\n  {title}\n{'='*60}")
+def _get_dims(): return sparse.load_npz(CSR_MATRIX_PATH).shape
 
 def _load_bpr_data():
-    log.info("Loading BPR data...")
-    d         = np.load(BPR_DATA_PATH)
-    all_items = d["all_items"]
-    item_pop  = d["item_pop_values"]
-    with open(USER_POSITIVES_PATH, "rb") as f:
-        user_pos = pickle.load(f)
-    log.info(f"  {len(user_pos):,} users | {len(all_items):,} items")
-    return user_pos, all_items, item_pop
+    d = np.load(BPR_DATA_PATH)
+    with open(USER_POSITIVES_PATH, "rb") as f: pos = pickle.load(f)
+    return pos, d["all_items"], d["item_pop_values"]
 
 def _load_feature_tensors():
-    log.info("Loading feature tensors...")
-    t = {
-        "sbert":   torch.load(SBERT_EMBEDDINGS_PATH,   weights_only=False),
-        "imdb":    torch.load(IMDB_FEATURES_PATH,      weights_only=False),
-        "pop":     torch.load(POPULARITY_PATH,          weights_only=False),
+    return {
+        "sbert":   torch.load(SBERT_EMBEDDINGS_PATH, weights_only=False),
+        "imdb":    torch.load(IMDB_FEATURES_PATH, weights_only=False),
+        "pop":     torch.load(POPULARITY_PATH, weights_only=False),
         "history": torch.load(HISTORY_EMBEDDINGS_PATH, weights_only=False),
     }
-    for k, v in t.items():
-        log.info(f"  {k:<10}: {tuple(v.shape)}")
-    return t
-
-
-# ── ALS ───────────────────────────────────────────────────────────────────────
-
-def train_als(skip_if_exists: bool = False) -> ALS:
-    _banner("ALS — Matrix Factorisation Baseline")
-    if skip_if_exists and ALS_PATH.exists():
-        log.info(f"Loading existing ALS factors...")
-        return ALS.load(ALS_PATH)
-    csr   = _load_csr()
-    model = ALS(n_factors=LATENT_DIM_K, n_iterations=ALS_ITERATIONS, reg=ALS_REG)
-    model.fit(csr)
-    model.save(ALS_PATH)
-    log.info(f"ALS done — final RMSE: {model.train_rmse_history[-1]:.5f}")
-    return model
-
-
-# ── BPR ───────────────────────────────────────────────────────────────────────
-
-def train_bpr(als_model: ALS) -> BPR:
-    _banner("BPR — Bayesian Personalized Ranking")
-    n_users, n_items = _get_dims()
-    user_pos, all_items, item_pop = _load_bpr_data()
-
-    model = BPR(
-        n_users=n_users, n_items=n_items,
-        n_factors=LATENT_DIM_K, lr=LR_BPR, reg=BPR_REG,
-        n_epochs=BPR_EPOCHS, batch_size=BPR_BATCH_SIZE,
-        samples_per_epoch=BPR_SAMPLES_PER_EPOCH, device=DEVICE,
-    )
-    model.init_from_als(als_model)
-    model.fit(user_pos, all_items, item_pop)
-    model.save(BPR_FACTORS_PATH)
-    log.info(f"BPR done — final loss: {model.train_loss_history[-1]:.5f}")
-    return model
-
-
-# ── Hybrid ────────────────────────────────────────────────────────────────────
-
-def train_hybrid(als_model: ALS, bpr_model: BPR) -> HybridTrainer:
-    _banner("Hybrid — CF + Content (BPR ranking loss)")
-    n_users, n_items = _get_dims()
-    tensors = _load_feature_tensors()
-    _, _, item_pop = _load_bpr_data()  # need item_pop for negative sampling
-
-    # Reload all_items too
-    d         = np.load(BPR_DATA_PATH)
-    all_items = d["all_items"]
-
-    hybrid_model = HybridModel(
-        n_users=n_users, n_items=n_items,
-        embed_dim=EMBED_DIM_D, n_heads=NUM_HEADS,
-    )
-    log.info(repr(hybrid_model))
-
-    hybrid_model.load_cf_weights(
-        uf   = als_model.get_user_factors_tensor(),
-        if_  = als_model.get_item_factors_tensor(),
-        ubpr = bpr_model.get_user_embeddings_tensor(),
-        ibpr = bpr_model.get_item_embeddings_tensor(),
-    )
-
-    trainer = HybridTrainer(
-        model             = hybrid_model,
-        sbert_emb         = tensors["sbert"],
-        imdb_feats        = tensors["imdb"],
-        popularity        = tensors["pop"],
-        history_emb       = tensors["history"],
-        all_items         = all_items,
-        item_pop          = item_pop,
-        device            = DEVICE,
-        lr                = LR_HYBRID,
-        weight_decay      = HYBRID_WEIGHT_DECAY,
-        n_epochs          = HYBRID_EPOCHS,
-        batch_size        = HYBRID_BATCH_SIZE,
-        samples_per_epoch = HYBRID_SAMPLES_PER_EPOCH,
-        patience          = EARLY_STOP_PATIENCE,
-        freeze_epochs     = FREEZE_EPOCHS,
-    )
-    trainer.fit()
-    log.info(f"Hybrid done — best val loss: {trainer.best_val_loss:.5f}")
-    return trainer
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(args):
     t0 = time.time()
     set_seed()
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    run_all    = args.model is None
-    als = bpr  = hybrid = None
+    to_run = set(args.models)
+    if "all" in to_run:
+        to_run = {"als", "bpr", "easr", "hybrid", "twotower", "lightgcn", "sasrec"}
 
-    # ALS
-    if run_all or args.model == "als":
-        als = train_als(skip_if_exists=args.skip_als)
-    elif ALS_PATH.exists():
-        log.info("Loading existing ALS...")
+    als = bpr = hybrid = twotower = lightgcn = sasrec = None
+
+    # --- 1. CF Baselines ---
+    if "als" in to_run:
+        _banner("ALS — Matrix Factorisation")
+        als = ALS(n_factors=LATENT_DIM_K, n_iterations=ALS_ITERATIONS, reg=ALS_REG)
+        als.fit(sparse.load_npz(CSR_MATRIX_PATH))
+        als.save(ALS_PATH)
+    elif "bpr" in to_run or "hybrid" in to_run:
         als = ALS.load(ALS_PATH)
-    else:
-        if args.model in ("bpr","hybrid"):
-            raise FileNotFoundError(f"ALS factors not found. Run --model als first.")
 
-    # BPR
-    if run_all or args.model == "bpr":
-        bpr = train_bpr(als)
-    elif BPR_FACTORS_PATH.exists():
-        log.info("Loading existing BPR...")
+    if "bpr" in to_run:
+        _banner("BPR — Bayesian Personalized Ranking")
+        n_u, n_i = _get_dims()
+        user_pos, all_items, item_pop = _load_bpr_data()
+        bpr = BPR(n_users=n_u, n_items=n_i, n_factors=LATENT_DIM_K, lr=LR_BPR, reg=BPR_REG, n_epochs=BPR_EPOCHS, batch_size=BPR_BATCH_SIZE, samples_per_epoch=BPR_SAMPLES_PER_EPOCH, device=DEVICE)
+        bpr.init_from_als(als)
+        bpr.fit(user_pos, all_items, item_pop)
+        bpr.save(BPR_FACTORS_PATH)
+    elif "hybrid" in to_run:
         bpr = BPR.load(BPR_FACTORS_PATH, device=DEVICE)
 
-    # Hybrid
-    if run_all or args.model == "hybrid":
-        if als is None or bpr is None:
-            raise RuntimeError("Hybrid needs ALS and BPR. Run both first.")
-        hybrid = train_hybrid(als, bpr)
+    # --- 1b. EASE^R — Embarrassingly Shallow AutoEncoder ----------------
+    if "easr" in to_run:
+        _banner("EASE^R — Embarrassingly Shallow AutoEncoder")
+        # Loads the same CSR matrix used by ALS — no extra preprocessing needed.
+        easr = EASR(reg=EASR_REG)
+        easr.fit(sparse.load_npz(CSR_MATRIX_PATH))
+        easr.save(EASR_PATH)
 
-    # Summary
-    log.info("")
-    log.info("╔══════════════════════════════════════════════════════╗")
-    log.info("║  TRAINING COMPLETE                                    ║")
-    log.info(f"║  Total: {_elapsed(t0):<47}║")
-    log.info("╠══════════════════════════════════════════════════════╣")
-    if als:
-        log.info(f"║  ALS    RMSE : {als.train_rmse_history[-1]:.5f}{'':>38}║")
-    if bpr:
-        log.info(f"║  BPR    loss : {bpr.train_loss_history[-1]:.5f}{'':>38}║")
-    if hybrid:
-        log.info(f"║  Hybrid loss : {hybrid.best_val_loss:.5f}{'':>38}║")
-    log.info("╠══════════════════════════════════════════════════════╣")
-    for label, path in [("ALS", ALS_PATH), ("BPR", BPR_FACTORS_PATH), ("Hybrid", HYBRID_CKPT_PATH)]:
-        ok = "✓" if path.exists() else "✗"
-        log.info(f"║  [{ok}] {label:<20} {path.name:<30}║")
-    log.info("╚══════════════════════════════════════════════════════╝")
+    # --- 2. Neural Models ---
+    if "hybrid" in to_run or "twotower" in to_run:
+        tensors = _load_feature_tensors()
 
+    if "hybrid" in to_run:
+        _banner("Hybrid — CF + Content")
+        n_u, n_i = _get_dims()
+        user_pos, all_items, item_pop = _load_bpr_data()
+        m = HybridModel(n_users=n_u, n_items=n_i, embed_dim=EMBED_DIM_D)
+        m.load_cf_weights(als.get_user_factors_tensor(), als.get_item_factors_tensor(), bpr.get_user_embeddings_tensor(), bpr.get_item_embeddings_tensor())
+        
+        hybrid = HybridTrainer(
+            model=m, 
+            sbert_emb=tensors["sbert"], 
+            imdb_feats=tensors["imdb"], 
+            popularity=tensors["pop"], 
+            history_emb=tensors["history"], 
+            all_items=all_items, 
+            item_pop=item_pop, 
+            device=DEVICE, 
+            lr=LR_HYBRID, 
+            weight_decay=HYBRID_WEIGHT_DECAY, 
+            n_epochs=HYBRID_EPOCHS, 
+            batch_size=HYBRID_BATCH_SIZE, 
+            samples_per_epoch=HYBRID_SAMPLES_PER_EPOCH, 
+            patience=EARLY_STOP_PATIENCE, 
+            freeze_epochs=FREEZE_EPOCHS
+        )
+        hybrid.fit()
+
+    if "twotower" in to_run:
+        _banner("Two-Tower — Dual Encoder Model")
+        n_u, n_i = _get_dims()
+        _, all_items, item_pop = _load_bpr_data()
+        m = TwoTowerModel(n_users=n_u, n_items=n_i, embed_dim=EMBED_DIM_D)
+        
+        twotower = TwoTowerTrainer(
+            model=m, 
+            sbert_emb=tensors["sbert"], 
+            imdb_feats=tensors["imdb"], 
+            popularity=tensors["pop"], 
+            history_emb=tensors["history"], 
+            all_items=all_items, 
+            item_pop=item_pop, 
+            device=DEVICE, 
+            lr=LR_HYBRID, 
+            weight_decay=HYBRID_WEIGHT_DECAY, 
+            n_epochs=HYBRID_EPOCHS, 
+            batch_size=HYBRID_BATCH_SIZE, 
+            samples_per_epoch=HYBRID_SAMPLES_PER_EPOCH, 
+            patience=EARLY_STOP_PATIENCE
+        )
+        twotower.fit()
+
+    # --- 3. Advanced Baselines ---
+    if "lightgcn" in to_run:
+        _banner("LightGCN — Graph Neural Network")
+        if not LIGHTGCN_GRAPH_PATH.exists(): raise FileNotFoundError("Graph missing. Run preprocess.py --tasks lightgcn")
+        n_u, n_i = _get_dims()
+        user_pos, all_items, item_pop = _load_bpr_data()
+        shrunk_model = LightGCN(n_users=n_u, n_items=n_i, embed_dim=64, n_layers=2)
+        lightgcn = LightGCNTrainer(shrunk_model, LIGHTGCN_GRAPH_PATH, all_items, item_pop)
+        lightgcn.fit(user_pos)
+
+    if "sasrec" in to_run:
+        _banner("SASRec — Sequential Transformer")
+        if not SASREC_SEQS_PATH.exists(): raise FileNotFoundError("Seqs missing. Run preprocess.py --tasks sasrec")
+        _, n_i = _get_dims()
+        _, all_items, _ = _load_bpr_data()
+        sasrec = SASRecTrainer(SASRec(n_i), SASREC_SEQS_PATH, all_items)
+        sasrec.fit()
+
+    log.info(f"\n{'='*60}\n  TRAINING COMPLETE — {_elapsed(t0)}\n{'='*60}")
 
 def _parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", choices=["als","bpr","hybrid"], default=None)
-    p.add_argument("--skip-als", action="store_true",
-                   help="Load existing ALS instead of retraining")
+    p.add_argument("--models", nargs="+", default=["all"],
+                   choices=["all", "als", "bpr", "easr", "hybrid", "twotower", "lightgcn", "sasrec"])
     return p.parse_args()
 
-
-if __name__ == "__main__":
-    main(_parse_args())
+if __name__ == "__main__": main(_parse_args())
