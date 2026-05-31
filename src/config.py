@@ -112,7 +112,7 @@ BPR_SAMPLES_PER_EPOCH = _P["samp"]
 
 # ── Hybrid ────────────────────────────────────────────────────────────────────
 LR_HYBRID           = 1e-3
-HYBRID_WEIGHT_DECAY = 1e-4
+HYBRID_WEIGHT_DECAY = 1e-3
 HYBRID_EPOCHS       = _P["ep"]
 HYBRID_BATCH_SIZE   = _P["batch"]
 HYBRID_SAMPLES_PER_EPOCH = _P["samp"]
