@@ -4,6 +4,7 @@ data/processed/
 
 # Model artifacts
 results/
+reports/
 
 # Python
 __pycache__/
