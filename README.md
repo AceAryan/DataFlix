@@ -19,7 +19,7 @@ A large-scale recommendation pipeline built on the MovieLens-32M dataset enriche
 
 ### Matrix Factorization (ALS)
 Approximates the user-item interaction matrix:
-$$ \hat{r}_{ui} = \mu + b_u + b_i + p_u^T q_i $$
+$$\hat{r}_{ui} = \mu + b_u + b_i + p_u^T q_i$$
 Where $p_u$ and $q_i$ are latent vectors, and $b_u, b_i$ are learned biases.
 
 ### Bayesian Personalized Ranking (BPR)
@@ -28,7 +28,7 @@ L = -log σ(r̂_ui - r̂_uj)
 
 ### LightGCN
 Learns embeddings through linear propagation over the bipartite interaction graph, capturing higher-order collaborative relationships without handcrafted features:
-$$ \mathbf{E}^{(k+1)} = \hat{A}\mathbf{E}^{(k)}     $$
+$$\mathbf{E}^{(k+1)} = \hat{A}\mathbf{E}^{(k)}$$
 
 ### Two-Tower Retrieval
 A purely semantic dual-encoder architecture. The Item Tower encodes SBERT plot descriptions and IMDb genres, while the User Tower encodes chronological watch history, enabling zero-shot cold-start recommendations.
