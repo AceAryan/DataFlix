@@ -37,7 +37,7 @@ from src.models.easr     import EASR                                    # ← EA
 from src.models.hybrid   import HybridModel, HybridTrainer
 from src.models.twotower import TwoTowerModel, TwoTowerTrainer
 from src.models.lightgcn import LightGCN, LightGCNTrainer, LIGHTGCN_CKPT_PATH
-from src.models.sasrec   import SASRec, SASRecTrainer, SASREC_CKPT_PATH
+# from src.models.sasrec   import SASRec, SASRecTrainer, SASREC_CKPT_PATH
 
 TWOTOWER_CKPT_PATH  = RESULTS_DIR / "twotower_best.pt"
 LIGHTGCN_GRAPH_PATH = PROCESSED_DIR / "lightgcn_graph.npz"
@@ -172,13 +172,13 @@ def main(args):
         lightgcn = LightGCNTrainer(shrunk_model, LIGHTGCN_GRAPH_PATH, all_items, item_pop)
         lightgcn.fit(user_pos)
 
-    if "sasrec" in to_run:
-        _banner("SASRec — Sequential Transformer")
-        if not SASREC_SEQS_PATH.exists(): raise FileNotFoundError("Seqs missing. Run preprocess.py --tasks sasrec")
-        _, n_i = _get_dims()
-        _, all_items, _ = _load_bpr_data()
-        sasrec = SASRecTrainer(SASRec(n_i), SASREC_SEQS_PATH, all_items)
-        sasrec.fit()
+    # if "sasrec" in to_run:
+    #     _banner("SASRec — Sequential Transformer")
+    #     if not SASREC_SEQS_PATH.exists(): raise FileNotFoundError("Seqs missing. Run preprocess.py --tasks sasrec")
+    #     _, n_i = _get_dims()
+    #     _, all_items, _ = _load_bpr_data()
+    #     sasrec = SASRecTrainer(SASRec(n_i), SASREC_SEQS_PATH, all_items)
+    #     sasrec.fit()
 
     log.info(f"\n{'='*60}\n  TRAINING COMPLETE — {_elapsed(t0)}\n{'='*60}")
 

@@ -36,7 +36,7 @@ from src.models.easr     import EASR, score_easr                        # ← EA
 from src.models.hybrid   import HybridModel, score_all_items as score_hybrid
 from src.models.twotower import TwoTowerModel, score_twotower
 from src.models.lightgcn import LightGCN, score_lightgcn
-from src.models.sasrec   import SASRec, score_sasrec
+# from src.models.sasrec   import SASRec, score_sasrec
 
 TWOTOWER_CKPT_PATH  = RESULTS_DIR / "twotower_best.pt"
 LIGHTGCN_CKPT_PATH  = RESULTS_DIR / "lightgcn_best.pt"
@@ -276,24 +276,24 @@ def main(args):
         all_results["LightGCN"] = result
         _save_result("LightGCN", result)
 
-    # 6. SASRec
-    if "sasrec" in to_run and SASREC_CKPT_PATH.exists():
-        log.info("\nEvaluating SASRec...")
-        ck = torch.load(SASREC_CKPT_PATH, map_location=DEVICE, weights_only=False)
-        sr = SASRec(ck["n_items"])
-        sr.load_state_dict(ck["model_state"])
-        sr.to(DEVICE).eval()
+    # # 6. SASRec
+    # if "sasrec" in to_run and SASREC_CKPT_PATH.exists():
+    #     log.info("\nEvaluating SASRec...")
+    #     ck = torch.load(SASREC_CKPT_PATH, map_location=DEVICE, weights_only=False)
+    #     sr = SASRec(ck["n_items"])
+    #     sr.load_state_dict(ck["model_state"])
+    #     sr.to(DEVICE).eval()
         
-        user_histories = _get_sasrec_histories(train_df)
+    #     user_histories = _get_sasrec_histories(train_df)
         
-        def sr_score(uid):
-            hist = user_histories.get(uid, [])
-            if not hist: return np.zeros(ck["n_items"], dtype=np.float32)
-            return score_sasrec(sr, hist, device=DEVICE)
+    #     def sr_score(uid):
+    #         hist = user_histories.get(uid, [])
+    #         if not hist: return np.zeros(ck["n_items"], dtype=np.float32)
+    #         return score_sasrec(sr, hist, device=DEVICE)
             
-        result = evaluate_model("SASRec", sr_score, eval_df, train_df, cold)
-        all_results["SASRec"] = result
-        _save_result("SASRec", result)
+    #     result = evaluate_model("SASRec", sr_score, eval_df, train_df, cold)
+    #     all_results["SASRec"] = result
+    #     _save_result("SASRec", result)
 
     if all_results:
         _print_comparison(all_results)
