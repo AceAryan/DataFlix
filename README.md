@@ -33,7 +33,7 @@ $$\mathbf{E}^{(k+1)} = \hat{A}\mathbf{E}^{(k)}$$
 ### Two-Tower Retrieval
 A purely semantic dual-encoder architecture. The Item Tower encodes SBERT plot descriptions and IMDb genres, while the User Tower encodes chronological watch history, enabling zero-shot cold-start recommendations.
 
-### EASE^R$ (Embarrassingly Shallow AutoEncoders)
+### EASE^R (Embarrassingly Shallow AutoEncoders)
 A closed-form linear autoencoder that learns a full-rank item-item weight matrix $B$ to reconstruct the user-item interaction matrix $X$. It enforces a strict zero-diagonal constraint ($\text{diag}(B) = 0$) so an item cannot predict itself:
 $$B = I - P \cdot \text{diag}(P)^{-1} \quad \text{where} \quad P = (X^T X + \lambda I)^{-1}$$
 By bypassing gradient descent and directly computing the regularized inverse of the item-item Gram matrix, it acts as a mathematically optimal, highly efficient collaborative filter for sparse datasets.
